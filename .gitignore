@@ -1,0 +1,4 @@
+*.db
+*.pids
+bin/
+logs/
