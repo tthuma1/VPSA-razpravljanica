@@ -146,7 +146,7 @@ func main() {
 }
 
 func (c *Client) Connect(controlAddr string) error {
-	conn, err := grpc.Dial(controlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(controlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return fmt.Errorf("failed to connect to control plane: %w", err)
 	}
@@ -162,14 +162,14 @@ func (c *Client) Connect(controlAddr string) error {
 	}
 
 	// Connect to head
-	c.headConn, err = grpc.Dial(state.Head.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	c.headConn, err = grpc.NewClient(state.Head.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return fmt.Errorf("failed to connect to head: %w", err)
 	}
 	c.headClient = pb.NewMessageBoardClient(c.headConn)
 
 	// Connect to tail
-	c.tailConn, err = grpc.Dial(state.Tail.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	c.tailConn, err = grpc.NewClient(state.Tail.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return fmt.Errorf("failed to connect to tail: %w", err)
 	}
@@ -290,7 +290,7 @@ func (c *Client) Subscribe(userID int64, topicIDs []int64) {
 	}
 
 	// Connect to subscription node
-	conn, err := grpc.Dial(subResp.Node.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(subResp.Node.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		fmt.Printf("Error connecting to subscription node: %v\n", err)
 		return

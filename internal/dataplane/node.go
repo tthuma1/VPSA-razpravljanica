@@ -327,7 +327,7 @@ func (n *Node) replicateWrite(op *pb.WriteOp) {
 		return
 	}
 
-	conn, err := grpc.Dial(n.nextNode, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(n.nextNode, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Printf("Failed to connect to next node: %v", err)
 		return
@@ -349,7 +349,7 @@ func (n *Node) notifyEvent(event *pb.MessageEvent) {
 		return
 	}
 
-	conn, err := grpc.Dial(n.nextNode, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(n.nextNode, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return
 	}

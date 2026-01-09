@@ -81,7 +81,7 @@ func main() {
 func registerWithControlPlane(nodeID, address, controlAddr string, node *dataplane.Node) {
 	time.Sleep(1 * time.Second) // Wait for server to start
 
-	conn, err := grpc.Dial(controlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(controlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Printf("Failed to connect to control plane: %v", err)
 		return
