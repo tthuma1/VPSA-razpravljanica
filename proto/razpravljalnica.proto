@@ -53,6 +53,7 @@ message NodeInfo {
 
 service MessageBoard {
   rpc CreateUser(CreateUserRequest) returns (User);
+  rpc GetUser(GetUserRequest) returns (User);
   rpc CreateTopic(CreateTopicRequest) returns (Topic);
   rpc PostMessage(PostMessageRequest) returns (Message);
   rpc LikeMessage(LikeMessageRequest) returns (Message);
@@ -63,6 +64,10 @@ service MessageBoard {
 }
 
 message CreateUserRequest {
+  string name = 1;
+}
+
+message GetUserRequest {
   string name = 1;
 }
 

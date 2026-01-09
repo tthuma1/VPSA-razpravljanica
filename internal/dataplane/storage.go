@@ -37,7 +37,7 @@ func (s *Storage) initSchema() error {
 	schema := `
 	CREATE TABLE IF NOT EXISTS users (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		name TEXT NOT NULL
+		name TEXT NOT NULL UNIQUE
 	);
 
 	CREATE TABLE IF NOT EXISTS topics (
@@ -93,6 +93,22 @@ func (s *Storage) CreateUser(name string) (*pb.User, error) {
 	}
 
 	return &pb.User{Id: id, Name: name}, nil
+}
+
+func (s *Storage) GetUserByName(name string) (*pb.User, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var user pb.User
+	err := s.db.QueryRow("SELECT id, name FROM users WHERE name = ?", name).Scan(&user.Id, &user.Name)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil // User not found
+		}
+		return nil, err
+	}
+
+	return &user, nil
 }
 
 func (s *Storage) CreateTopic(name string) (*pb.Topic, error) {

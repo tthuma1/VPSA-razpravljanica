@@ -99,6 +99,26 @@ func (n *Node) CreateUser(ctx context.Context, req *pb.CreateUserRequest) (*pb.U
 	return user, nil
 }
 
+func (n *Node) GetUser(ctx context.Context, req *pb.GetUserRequest) (*pb.User, error) {
+	// Reads can be served by Tail (strong consistency) or Head (read-your-writes, though not strictly guaranteed here without more logic).
+	// For simplicity and consistency with other reads, let's enforce Tail.
+	// However, for login, we might want to check Head if we just created the user.
+	// But standard chain replication says reads go to Tail.
+	if n.role != RoleTail {
+		return nil, fmt.Errorf("not the tail node")
+	}
+
+	user, err := n.storage.GetUserByName(req.Name)
+	if err != nil {
+		return nil, err
+	}
+	if user == nil {
+		return nil, fmt.Errorf("user not found")
+	}
+
+	return user, nil
+}
+
 func (n *Node) CreateTopic(ctx context.Context, req *pb.CreateTopicRequest) (*pb.Topic, error) {
 	if n.role != RoleHead {
 		return nil, fmt.Errorf("not the head node")

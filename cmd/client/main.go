@@ -24,10 +24,11 @@ var (
 )
 
 type Client struct {
-	headConn   *grpc.ClientConn
-	tailConn   *grpc.ClientConn
-	headClient pb.MessageBoardClient
-	tailClient pb.MessageBoardClient
+	headConn    *grpc.ClientConn
+	tailConn    *grpc.ClientConn
+	headClient  pb.MessageBoardClient
+	tailClient  pb.MessageBoardClient
+	currentUser *pb.User
 }
 
 func main() {
@@ -41,18 +42,60 @@ func main() {
 	}
 
 	fmt.Println("=== MessageBoard Client ===")
+
+	// Authentication Loop
+	scanner := bufio.NewScanner(os.Stdin)
+	for client.currentUser == nil {
+		fmt.Println("Please login or register:")
+		fmt.Println("  1. register <name>")
+		fmt.Println("  2. login <name>")
+		fmt.Println("  3. quit")
+		fmt.Print("> ")
+
+		if !scanner.Scan() {
+			return
+		}
+
+		line := scanner.Text()
+		parts := strings.Fields(line)
+		if len(parts) == 0 {
+			continue
+		}
+
+		cmd := parts[0]
+		args := parts[1:]
+
+		switch cmd {
+		case "register":
+			if len(args) < 1 {
+				fmt.Println("Usage: register <name>")
+				continue
+			}
+			client.RegisterUser(strings.Join(args, " "))
+		case "login":
+			if len(args) < 1 {
+				fmt.Println("Usage: login <name>")
+				continue
+			}
+			client.LoginUser(strings.Join(args, " "))
+		case "quit", "exit":
+			return
+		default:
+			fmt.Println("Unknown command. Please register or login first.")
+		}
+	}
+
+	fmt.Printf("\nWelcome, %s (ID: %d)!\n", client.currentUser.Name, client.currentUser.Id)
 	fmt.Println("Commands:")
-	fmt.Println("  1. create-user <name>")
-	fmt.Println("  2. create-topic <name>")
-	fmt.Println("  3. post <topic_id> <user_id> <text>")
-	fmt.Println("  4. like <topic_id> <message_id> <user_id>")
-	fmt.Println("  5. list-topics")
-	fmt.Println("  6. get-messages <topic_id> [from_id] [limit]")
-	fmt.Println("  7. subscribe <user_id> <topic_id1> [topic_id2...]")
-	fmt.Println("  8. quit")
+	fmt.Println("  1. create-topic <name>")
+	fmt.Println("  2. post <topic_id> <text>")
+	fmt.Println("  3. like <topic_id> <message_id>")
+	fmt.Println("  4. list-topics")
+	fmt.Println("  5. get-messages <topic_id> [from_id] [limit]")
+	fmt.Println("  6. subscribe <topic_id1> [topic_id2...]")
+	fmt.Println("  7. quit")
 	fmt.Println()
 
-	scanner := bufio.NewScanner(os.Stdin)
 	for {
 		fmt.Print("> ")
 		if !scanner.Scan() {
@@ -69,13 +112,6 @@ func main() {
 		args := parts[1:]
 
 		switch cmd {
-		case "create-user":
-			if len(args) < 1 {
-				fmt.Println("Usage: create-user <name>")
-				continue
-			}
-			client.CreateUser(strings.Join(args, " "))
-
 		case "create-topic":
 			if len(args) < 1 {
 				fmt.Println("Usage: create-topic <name>")
@@ -84,24 +120,22 @@ func main() {
 			client.CreateTopic(strings.Join(args, " "))
 
 		case "post":
-			if len(args) < 3 {
-				fmt.Println("Usage: post <topic_id> <user_id> <text>")
+			if len(args) < 2 {
+				fmt.Println("Usage: post <topic_id> <text>")
 				continue
 			}
 			topicID, _ := strconv.ParseInt(args[0], 10, 64)
-			userID, _ := strconv.ParseInt(args[1], 10, 64)
-			text := strings.Join(args[2:], " ")
-			client.PostMessage(topicID, userID, text)
+			text := strings.Join(args[1:], " ")
+			client.PostMessage(topicID, text)
 
 		case "like":
-			if len(args) < 3 {
-				fmt.Println("Usage: like <topic_id> <message_id> <user_id>")
+			if len(args) < 2 {
+				fmt.Println("Usage: like <topic_id> <message_id>")
 				continue
 			}
 			topicID, _ := strconv.ParseInt(args[0], 10, 64)
 			messageID, _ := strconv.ParseInt(args[1], 10, 64)
-			userID, _ := strconv.ParseInt(args[2], 10, 64)
-			client.LikeMessage(topicID, messageID, userID)
+			client.LikeMessage(topicID, messageID)
 
 		case "list-topics":
 			client.ListTopics()
@@ -124,17 +158,16 @@ func main() {
 			client.GetMessages(topicID, fromID, limit)
 
 		case "subscribe":
-			if len(args) < 2 {
-				fmt.Println("Usage: subscribe <user_id> <topic_id1> [topic_id2...]")
+			if len(args) < 1 {
+				fmt.Println("Usage: subscribe <topic_id1> [topic_id2...]")
 				continue
 			}
-			userID, _ := strconv.ParseInt(args[0], 10, 64)
 			topicIDs := make([]int64, 0)
-			for _, arg := range args[1:] {
+			for _, arg := range args {
 				tid, _ := strconv.ParseInt(arg, 10, 64)
 				topicIDs = append(topicIDs, tid)
 			}
-			client.Subscribe(userID, topicIDs)
+			client.Subscribe(topicIDs)
 
 		case "quit", "exit":
 			return
@@ -179,17 +212,32 @@ func (c *Client) Connect(controlAddr string) error {
 	return nil
 }
 
-func (c *Client) CreateUser(name string) {
+func (c *Client) RegisterUser(name string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	user, err := c.headClient.CreateUser(ctx, &pb.CreateUserRequest{Name: name})
 	if err != nil {
-		fmt.Printf("Error: %v\n", err)
+		fmt.Printf("Error registering: %v\n", err)
 		return
 	}
 
-	fmt.Printf("Created user: ID=%d, Name=%s\n", user.Id, user.Name)
+	c.currentUser = user
+	fmt.Printf("Registered successfully: ID=%d, Name=%s\n", user.Id, user.Name)
+}
+
+func (c *Client) LoginUser(name string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	user, err := c.tailClient.GetUser(ctx, &pb.GetUserRequest{Name: name})
+	if err != nil {
+		fmt.Printf("Error logging in: %v\n", err)
+		return
+	}
+
+	c.currentUser = user
+	fmt.Printf("Logged in successfully: ID=%d, Name=%s\n", user.Id, user.Name)
 }
 
 func (c *Client) CreateTopic(name string) {
@@ -205,13 +253,13 @@ func (c *Client) CreateTopic(name string) {
 	fmt.Printf("Created topic: ID=%d, Name=%s\n", topic.Id, topic.Name)
 }
 
-func (c *Client) PostMessage(topicID, userID int64, text string) {
+func (c *Client) PostMessage(topicID int64, text string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	msg, err := c.headClient.PostMessage(ctx, &pb.PostMessageRequest{
 		TopicId: topicID,
-		UserId:  userID,
+		UserId:  c.currentUser.Id,
 		Text:    text,
 	})
 	if err != nil {
@@ -222,14 +270,14 @@ func (c *Client) PostMessage(topicID, userID int64, text string) {
 	fmt.Printf("Posted message: ID=%d, User=%d, Likes=%d\n", msg.Id, msg.UserId, msg.Likes)
 }
 
-func (c *Client) LikeMessage(topicID, messageID, userID int64) {
+func (c *Client) LikeMessage(topicID, messageID int64) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	msg, err := c.headClient.LikeMessage(ctx, &pb.LikeMessageRequest{
 		TopicId:   topicID,
 		MessageId: messageID,
-		UserId:    userID,
+		UserId:    c.currentUser.Id,
 	})
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
@@ -275,13 +323,13 @@ func (c *Client) GetMessages(topicID, fromID int64, limit int32) {
 	}
 }
 
-func (c *Client) Subscribe(userID int64, topicIDs []int64) {
+func (c *Client) Subscribe(topicIDs []int64) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	// Get subscription node
 	subResp, err := c.headClient.GetSubscriptionNode(ctx, &pb.SubscriptionNodeRequest{
-		UserId:  userID,
+		UserId:  c.currentUser.Id,
 		TopicId: topicIDs,
 	})
 	if err != nil {
@@ -300,7 +348,7 @@ func (c *Client) Subscribe(userID int64, topicIDs []int64) {
 	client := pb.NewMessageBoardClient(conn)
 
 	stream, err := client.SubscribeTopic(context.Background(), &pb.SubscribeTopicRequest{
-		UserId:         userID,
+		UserId:         c.currentUser.Id,
 		TopicId:        topicIDs,
 		FromMessageId:  0,
 		SubscribeToken: subResp.SubscribeToken,
