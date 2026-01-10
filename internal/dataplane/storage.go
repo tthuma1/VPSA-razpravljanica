@@ -2,7 +2,10 @@
 package dataplane
 
 import (
+	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"fmt"
 	"sync"
 	"time"
@@ -37,7 +40,9 @@ func (s *Storage) initSchema() error {
 	schema := `
 	CREATE TABLE IF NOT EXISTS users (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		name TEXT NOT NULL UNIQUE
+		name TEXT NOT NULL UNIQUE,
+		password_hash TEXT NOT NULL,
+		salt TEXT NOT NULL
 	);
 
 	CREATE TABLE IF NOT EXISTS topics (
@@ -78,11 +83,31 @@ func (s *Storage) initSchema() error {
 	return err
 }
 
-func (s *Storage) CreateUser(name string) (*pb.User, error) {
+func (s *Storage) CreateUser(name, password, salt string) (*pb.User, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	result, err := s.db.Exec("INSERT INTO users (name) VALUES (?)", name)
+	// Check if user already exists
+	var exists int
+	err := s.db.QueryRow("SELECT COUNT(*) FROM users WHERE name = ?", name).Scan(&exists)
+	if err != nil {
+		return nil, err
+	}
+	if exists > 0 {
+		return nil, fmt.Errorf("user with name '%s' already exists", name)
+	}
+
+	// If salt is not provided (e.g. from client), generate it
+	if salt == "" {
+		salt, err = generateSalt()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	hash := hashPassword(password, salt)
+
+	result, err := s.db.Exec("INSERT INTO users (name, password_hash, salt) VALUES (?, ?, ?)", name, hash, salt)
 	if err != nil {
 		return nil, err
 	}
@@ -92,7 +117,31 @@ func (s *Storage) CreateUser(name string) (*pb.User, error) {
 		return nil, err
 	}
 
-	return &pb.User{Id: id, Name: name}, nil
+	return &pb.User{Id: id, Name: name, PasswordHash: hash, Salt: salt}, nil
+}
+
+func (s *Storage) VerifyUser(name, password string) (*pb.User, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var user pb.User
+	var storedHash, salt string
+
+	err := s.db.QueryRow("SELECT id, name, password_hash, salt FROM users WHERE name = ?", name).Scan(&user.Id, &user.Name, &storedHash, &salt)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("invalid credentials")
+		}
+		return nil, err
+	}
+
+	if hashPassword(password, salt) != storedHash {
+		return nil, fmt.Errorf("invalid credentials")
+	}
+
+	user.PasswordHash = storedHash
+	user.Salt = salt
+	return &user, nil
 }
 
 func (s *Storage) GetUserByName(name string) (*pb.User, error) {
@@ -100,7 +149,7 @@ func (s *Storage) GetUserByName(name string) (*pb.User, error) {
 	defer s.mu.RUnlock()
 
 	var user pb.User
-	err := s.db.QueryRow("SELECT id, name FROM users WHERE name = ?", name).Scan(&user.Id, &user.Name)
+	err := s.db.QueryRow("SELECT id, name, password_hash, salt FROM users WHERE name = ?", name).Scan(&user.Id, &user.Name, &user.PasswordHash, &user.Salt)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil // User not found
@@ -287,4 +336,23 @@ func (s *Storage) GetLastSequence() int64 {
 
 func (s *Storage) Close() error {
 	return s.db.Close()
+}
+
+// Helper functions for password hashing
+const pepper = "super-secret-pepper-value"
+
+func generateSalt() (string, error) {
+	b := make([]byte, 16)
+	_, err := rand.Read(b)
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(b), nil
+}
+
+func hashPassword(password, salt string) string {
+	// Combine password, salt, and pepper
+	input := password + salt + pepper
+	hash := sha256.Sum256([]byte(input))
+	return base64.StdEncoding.EncodeToString(hash[:])
 }

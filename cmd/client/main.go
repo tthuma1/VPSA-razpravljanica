@@ -43,137 +43,153 @@ func main() {
 
 	fmt.Println("=== MessageBoard Client ===")
 
-	// Authentication Loop
 	scanner := bufio.NewScanner(os.Stdin)
-	for client.currentUser == nil {
-		fmt.Println("Please login or register:")
-		fmt.Println("  1. register <name>")
-		fmt.Println("  2. login <name>")
-		fmt.Println("  3. quit")
-		fmt.Print("> ")
 
-		if !scanner.Scan() {
-			return
-		}
+	fmt.Println("Please login or register:")
+	fmt.Println("  1. register <name> <password>")
+	fmt.Println("  2. login <name> <password>")
+	fmt.Println("  3. quit")
+	fmt.Print("> ")
 
-		line := scanner.Text()
-		parts := strings.Fields(line)
-		if len(parts) == 0 {
-			continue
-		}
-
-		cmd := parts[0]
-		args := parts[1:]
-
-		switch cmd {
-		case "register":
-			if len(args) < 1 {
-				fmt.Println("Usage: register <name>")
-				continue
-			}
-			client.RegisterUser(strings.Join(args, " "))
-		case "login":
-			if len(args) < 1 {
-				fmt.Println("Usage: login <name>")
-				continue
-			}
-			client.LoginUser(strings.Join(args, " "))
-		case "quit", "exit":
-			return
-		default:
-			fmt.Println("Unknown command. Please register or login first.")
-		}
-	}
-
-	fmt.Printf("\nWelcome, %s (ID: %d)!\n", client.currentUser.Name, client.currentUser.Id)
-	fmt.Println("Commands:")
-	fmt.Println("  1. create-topic <name>")
-	fmt.Println("  2. post <topic_id> <text>")
-	fmt.Println("  3. like <topic_id> <message_id>")
-	fmt.Println("  4. list-topics")
-	fmt.Println("  5. get-messages <topic_id> [from_id] [limit]")
-	fmt.Println("  6. subscribe <topic_id1> [topic_id2...]")
-	fmt.Println("  7. quit")
-	fmt.Println()
-
+	// Main application loop
 	for {
-		fmt.Print("> ")
-		if !scanner.Scan() {
-			break
+		// Authentication Loop
+		for client.currentUser == nil {
+			if !scanner.Scan() {
+				return
+			}
+
+			line := scanner.Text()
+			parts := strings.Fields(line)
+			if len(parts) == 0 {
+				continue
+			}
+
+			cmd := parts[0]
+			args := parts[1:]
+
+			switch cmd {
+			case "register":
+				if len(args) < 2 {
+					fmt.Println("Usage: register <name> <password>")
+					continue
+				}
+				client.RegisterUser(args[0], args[1])
+			case "login":
+				if len(args) < 2 {
+					fmt.Println("Usage: login <name> <password>")
+					continue
+				}
+				client.LoginUser(args[0], args[1])
+			case "quit", "exit":
+				return
+			default:
+				fmt.Println("Unknown command. Please register or login first.")
+				fmt.Println("  1. register <name> <password>")
+				fmt.Println("  2. login <name> <password>")
+				fmt.Println("  3. quit")
+				fmt.Print("> ")
+			}
 		}
 
-		line := scanner.Text()
-		parts := strings.Fields(line)
-		if len(parts) == 0 {
-			continue
-		}
+		fmt.Printf("\nWelcome, %s (ID: %d)!\n", client.currentUser.Name, client.currentUser.Id)
+		fmt.Println("Commands:")
+		fmt.Println("  1. create-topic <name>")
+		fmt.Println("  2. post <topic_id> <text>")
+		fmt.Println("  3. like <topic_id> <message_id>")
+		fmt.Println("  4. list-topics")
+		fmt.Println("  5. get-messages <topic_id> [from_id] [limit]")
+		fmt.Println("  6. subscribe <topic_id1> [topic_id2...]")
+		fmt.Println("  7. logout")
+		fmt.Println("  8. quit")
+		fmt.Println()
 
-		cmd := parts[0]
-		args := parts[1:]
+		// Command Loop
+		logout := false
+		for !logout {
+			fmt.Print("> ")
+			if !scanner.Scan() {
+				return
+			}
 
-		switch cmd {
-		case "create-topic":
-			if len(args) < 1 {
-				fmt.Println("Usage: create-topic <name>")
+			line := scanner.Text()
+			parts := strings.Fields(line)
+			if len(parts) == 0 {
 				continue
 			}
-			client.CreateTopic(strings.Join(args, " "))
 
-		case "post":
-			if len(args) < 2 {
-				fmt.Println("Usage: post <topic_id> <text>")
-				continue
-			}
-			topicID, _ := strconv.ParseInt(args[0], 10, 64)
-			text := strings.Join(args[1:], " ")
-			client.PostMessage(topicID, text)
+			cmd := parts[0]
+			args := parts[1:]
 
-		case "like":
-			if len(args) < 2 {
-				fmt.Println("Usage: like <topic_id> <message_id>")
-				continue
-			}
-			topicID, _ := strconv.ParseInt(args[0], 10, 64)
-			messageID, _ := strconv.ParseInt(args[1], 10, 64)
-			client.LikeMessage(topicID, messageID)
+			switch cmd {
+			case "create-topic":
+				if len(args) < 1 {
+					fmt.Println("Usage: create-topic <name>")
+					continue
+				}
+				client.CreateTopic(strings.Join(args, " "))
 
-		case "list-topics":
-			client.ListTopics()
+			case "post":
+				if len(args) < 2 {
+					fmt.Println("Usage: post <topic_id> <text>")
+					continue
+				}
+				topicID, _ := strconv.ParseInt(args[0], 10, 64)
+				text := strings.Join(args[1:], " ")
+				client.PostMessage(topicID, text)
 
-		case "get-messages":
-			if len(args) < 1 {
-				fmt.Println("Usage: get-messages <topic_id> [from_id] [limit]")
-				continue
-			}
-			topicID, _ := strconv.ParseInt(args[0], 10, 64)
-			fromID := int64(0)
-			limit := int32(10)
-			if len(args) > 1 {
-				fromID, _ = strconv.ParseInt(args[1], 10, 64)
-			}
-			if len(args) > 2 {
-				l, _ := strconv.ParseInt(args[2], 10, 32)
-				limit = int32(l)
-			}
-			client.GetMessages(topicID, fromID, limit)
+			case "like":
+				if len(args) < 2 {
+					fmt.Println("Usage: like <topic_id> <message_id>")
+					continue
+				}
+				topicID, _ := strconv.ParseInt(args[0], 10, 64)
+				messageID, _ := strconv.ParseInt(args[1], 10, 64)
+				client.LikeMessage(topicID, messageID)
 
-		case "subscribe":
-			if len(args) < 1 {
-				fmt.Println("Usage: subscribe <topic_id1> [topic_id2...]")
-				continue
-			}
-			topicIDs := make([]int64, 0)
-			for _, arg := range args {
-				tid, _ := strconv.ParseInt(arg, 10, 64)
-				topicIDs = append(topicIDs, tid)
-			}
-			client.Subscribe(topicIDs)
+			case "list-topics":
+				client.ListTopics()
 
-		case "quit", "exit":
-			return
+			case "get-messages":
+				if len(args) < 1 {
+					fmt.Println("Usage: get-messages <topic_id> [from_id] [limit]")
+					continue
+				}
+				topicID, _ := strconv.ParseInt(args[0], 10, 64)
+				fromID := int64(0)
+				limit := int32(10)
+				if len(args) > 1 {
+					fromID, _ = strconv.ParseInt(args[1], 10, 64)
+				}
+				if len(args) > 2 {
+					l, _ := strconv.ParseInt(args[2], 10, 32)
+					limit = int32(l)
+				}
+				client.GetMessages(topicID, fromID, limit)
 
-		default:
-			fmt.Println("Unknown command")
+			case "subscribe":
+				if len(args) < 1 {
+					fmt.Println("Usage: subscribe <topic_id1> [topic_id2...]")
+					continue
+				}
+				topicIDs := make([]int64, 0)
+				for _, arg := range args {
+					tid, _ := strconv.ParseInt(arg, 10, 64)
+					topicIDs = append(topicIDs, tid)
+				}
+				client.Subscribe(topicIDs)
+
+			case "logout":
+				client.currentUser = nil
+				logout = true
+				fmt.Println("Logged out.")
+
+			case "quit", "exit":
+				return
+
+			default:
+				fmt.Println("Unknown command")
+			}
 		}
 	}
 }
@@ -212,11 +228,11 @@ func (c *Client) Connect(controlAddr string) error {
 	return nil
 }
 
-func (c *Client) RegisterUser(name string) {
+func (c *Client) RegisterUser(name, password string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	user, err := c.headClient.CreateUser(ctx, &pb.CreateUserRequest{Name: name})
+	user, err := c.headClient.CreateUser(ctx, &pb.CreateUserRequest{Name: name, Password: password})
 	if err != nil {
 		fmt.Printf("Error registering: %v\n", err)
 		return
@@ -226,11 +242,11 @@ func (c *Client) RegisterUser(name string) {
 	fmt.Printf("Registered successfully: ID=%d, Name=%s\n", user.Id, user.Name)
 }
 
-func (c *Client) LoginUser(name string) {
+func (c *Client) LoginUser(name, password string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	user, err := c.tailClient.GetUser(ctx, &pb.GetUserRequest{Name: name})
+	user, err := c.tailClient.Login(ctx, &pb.LoginRequest{Name: name, Password: password})
 	if err != nil {
 		fmt.Printf("Error logging in: %v\n", err)
 		return

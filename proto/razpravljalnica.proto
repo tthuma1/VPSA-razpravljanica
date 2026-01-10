@@ -15,6 +15,8 @@ import "google/protobuf/timestamp.proto";
 message User {
   int64 id = 1;
   string name = 2;
+  string password_hash = 3;
+  string salt = 4;
 }
 
 message Topic {
@@ -53,6 +55,7 @@ message NodeInfo {
 
 service MessageBoard {
   rpc CreateUser(CreateUserRequest) returns (User);
+  rpc Login(LoginRequest) returns (User);
   rpc GetUser(GetUserRequest) returns (User);
   rpc CreateTopic(CreateTopicRequest) returns (Topic);
   rpc PostMessage(PostMessageRequest) returns (Message);
@@ -65,6 +68,13 @@ service MessageBoard {
 
 message CreateUserRequest {
   string name = 1;
+  string password = 2;
+  string salt = 3;
+}
+
+message LoginRequest {
+  string name = 1;
+  string password = 2;
 }
 
 message GetUserRequest {

@@ -83,17 +83,35 @@ func (n *Node) CreateUser(ctx context.Context, req *pb.CreateUserRequest) (*pb.U
 		return nil, fmt.Errorf("not the head node")
 	}
 
-	user, err := n.storage.CreateUser(req.Name)
+	user, err := n.storage.CreateUser(req.Name, req.Password, req.Salt)
 	if err != nil {
 		return nil, err
 	}
 
 	// Replicate to next node
 	if n.nextNode != "" {
+		// Update request with generated salt if it was empty
+		req.Salt = user.Salt
+
 		go n.replicateWrite(&pb.WriteOp{
 			Operation: &pb.WriteOp_CreateUser{CreateUser: req},
 			Sequence:  n.storage.NextSequence(),
 		})
+	}
+
+	return user, nil
+}
+
+func (n *Node) Login(ctx context.Context, req *pb.LoginRequest) (*pb.User, error) {
+	// Login is a read operation but involves password verification.
+	// In chain replication, reads go to Tail.
+	if n.role != RoleTail {
+		return nil, fmt.Errorf("not the tail node")
+	}
+
+	user, err := n.storage.VerifyUser(req.Name, req.Password)
+	if err != nil {
+		return nil, err
 	}
 
 	return user, nil
@@ -303,7 +321,7 @@ func (n *Node) ReplicateWrite(ctx context.Context, req *pb.ReplicationRequest) (
 
 	switch o := op.Operation.(type) {
 	case *pb.WriteOp_CreateUser:
-		_, err := n.storage.CreateUser(o.CreateUser.Name)
+		_, err := n.storage.CreateUser(o.CreateUser.Name, o.CreateUser.Password, o.CreateUser.Salt)
 		if err != nil {
 			return nil, err
 		}
