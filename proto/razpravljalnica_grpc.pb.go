@@ -26,11 +26,13 @@ const (
 	MessageBoard_Login_FullMethodName               = "/razpravljalnica.MessageBoard/Login"
 	MessageBoard_GetUser_FullMethodName             = "/razpravljalnica.MessageBoard/GetUser"
 	MessageBoard_CreateTopic_FullMethodName         = "/razpravljalnica.MessageBoard/CreateTopic"
+	MessageBoard_GetTopic_FullMethodName            = "/razpravljalnica.MessageBoard/GetTopic"
 	MessageBoard_PostMessage_FullMethodName         = "/razpravljalnica.MessageBoard/PostMessage"
 	MessageBoard_LikeMessage_FullMethodName         = "/razpravljalnica.MessageBoard/LikeMessage"
 	MessageBoard_GetSubscriptionNode_FullMethodName = "/razpravljalnica.MessageBoard/GetSubscriptionNode"
 	MessageBoard_ListTopics_FullMethodName          = "/razpravljalnica.MessageBoard/ListTopics"
 	MessageBoard_GetMessages_FullMethodName         = "/razpravljalnica.MessageBoard/GetMessages"
+	MessageBoard_GetMessagesByUser_FullMethodName   = "/razpravljalnica.MessageBoard/GetMessagesByUser"
 	MessageBoard_SubscribeTopic_FullMethodName      = "/razpravljalnica.MessageBoard/SubscribeTopic"
 )
 
@@ -42,11 +44,13 @@ type MessageBoardClient interface {
 	Login(ctx context.Context, in *LoginRequest, opts ...grpc.CallOption) (*User, error)
 	GetUser(ctx context.Context, in *GetUserRequest, opts ...grpc.CallOption) (*User, error)
 	CreateTopic(ctx context.Context, in *CreateTopicRequest, opts ...grpc.CallOption) (*Topic, error)
+	GetTopic(ctx context.Context, in *GetTopicRequest, opts ...grpc.CallOption) (*Topic, error)
 	PostMessage(ctx context.Context, in *PostMessageRequest, opts ...grpc.CallOption) (*Message, error)
 	LikeMessage(ctx context.Context, in *LikeMessageRequest, opts ...grpc.CallOption) (*Message, error)
 	GetSubscriptionNode(ctx context.Context, in *SubscriptionNodeRequest, opts ...grpc.CallOption) (*SubscriptionNodeResponse, error)
 	ListTopics(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*ListTopicsResponse, error)
 	GetMessages(ctx context.Context, in *GetMessagesRequest, opts ...grpc.CallOption) (*GetMessagesResponse, error)
+	GetMessagesByUser(ctx context.Context, in *GetMessagesByUserRequest, opts ...grpc.CallOption) (*GetMessagesResponse, error)
 	SubscribeTopic(ctx context.Context, in *SubscribeTopicRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MessageEvent], error)
 }
 
@@ -92,6 +96,16 @@ func (c *messageBoardClient) CreateTopic(ctx context.Context, in *CreateTopicReq
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(Topic)
 	err := c.cc.Invoke(ctx, MessageBoard_CreateTopic_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *messageBoardClient) GetTopic(ctx context.Context, in *GetTopicRequest, opts ...grpc.CallOption) (*Topic, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Topic)
+	err := c.cc.Invoke(ctx, MessageBoard_GetTopic_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -148,6 +162,16 @@ func (c *messageBoardClient) GetMessages(ctx context.Context, in *GetMessagesReq
 	return out, nil
 }
 
+func (c *messageBoardClient) GetMessagesByUser(ctx context.Context, in *GetMessagesByUserRequest, opts ...grpc.CallOption) (*GetMessagesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetMessagesResponse)
+	err := c.cc.Invoke(ctx, MessageBoard_GetMessagesByUser_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *messageBoardClient) SubscribeTopic(ctx context.Context, in *SubscribeTopicRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MessageEvent], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &MessageBoard_ServiceDesc.Streams[0], MessageBoard_SubscribeTopic_FullMethodName, cOpts...)
@@ -175,11 +199,13 @@ type MessageBoardServer interface {
 	Login(context.Context, *LoginRequest) (*User, error)
 	GetUser(context.Context, *GetUserRequest) (*User, error)
 	CreateTopic(context.Context, *CreateTopicRequest) (*Topic, error)
+	GetTopic(context.Context, *GetTopicRequest) (*Topic, error)
 	PostMessage(context.Context, *PostMessageRequest) (*Message, error)
 	LikeMessage(context.Context, *LikeMessageRequest) (*Message, error)
 	GetSubscriptionNode(context.Context, *SubscriptionNodeRequest) (*SubscriptionNodeResponse, error)
 	ListTopics(context.Context, *emptypb.Empty) (*ListTopicsResponse, error)
 	GetMessages(context.Context, *GetMessagesRequest) (*GetMessagesResponse, error)
+	GetMessagesByUser(context.Context, *GetMessagesByUserRequest) (*GetMessagesResponse, error)
 	SubscribeTopic(*SubscribeTopicRequest, grpc.ServerStreamingServer[MessageEvent]) error
 	mustEmbedUnimplementedMessageBoardServer()
 }
@@ -203,6 +229,9 @@ func (UnimplementedMessageBoardServer) GetUser(context.Context, *GetUserRequest)
 func (UnimplementedMessageBoardServer) CreateTopic(context.Context, *CreateTopicRequest) (*Topic, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateTopic not implemented")
 }
+func (UnimplementedMessageBoardServer) GetTopic(context.Context, *GetTopicRequest) (*Topic, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetTopic not implemented")
+}
 func (UnimplementedMessageBoardServer) PostMessage(context.Context, *PostMessageRequest) (*Message, error) {
 	return nil, status.Error(codes.Unimplemented, "method PostMessage not implemented")
 }
@@ -217,6 +246,9 @@ func (UnimplementedMessageBoardServer) ListTopics(context.Context, *emptypb.Empt
 }
 func (UnimplementedMessageBoardServer) GetMessages(context.Context, *GetMessagesRequest) (*GetMessagesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetMessages not implemented")
+}
+func (UnimplementedMessageBoardServer) GetMessagesByUser(context.Context, *GetMessagesByUserRequest) (*GetMessagesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetMessagesByUser not implemented")
 }
 func (UnimplementedMessageBoardServer) SubscribeTopic(*SubscribeTopicRequest, grpc.ServerStreamingServer[MessageEvent]) error {
 	return status.Error(codes.Unimplemented, "method SubscribeTopic not implemented")
@@ -314,6 +346,24 @@ func _MessageBoard_CreateTopic_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
+func _MessageBoard_GetTopic_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetTopicRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MessageBoardServer).GetTopic(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MessageBoard_GetTopic_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MessageBoardServer).GetTopic(ctx, req.(*GetTopicRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _MessageBoard_PostMessage_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(PostMessageRequest)
 	if err := dec(in); err != nil {
@@ -404,6 +454,24 @@ func _MessageBoard_GetMessages_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
+func _MessageBoard_GetMessagesByUser_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetMessagesByUserRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MessageBoardServer).GetMessagesByUser(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MessageBoard_GetMessagesByUser_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MessageBoardServer).GetMessagesByUser(ctx, req.(*GetMessagesByUserRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _MessageBoard_SubscribeTopic_Handler(srv interface{}, stream grpc.ServerStream) error {
 	m := new(SubscribeTopicRequest)
 	if err := stream.RecvMsg(m); err != nil {
@@ -439,6 +507,10 @@ var MessageBoard_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _MessageBoard_CreateTopic_Handler,
 		},
 		{
+			MethodName: "GetTopic",
+			Handler:    _MessageBoard_GetTopic_Handler,
+		},
+		{
 			MethodName: "PostMessage",
 			Handler:    _MessageBoard_PostMessage_Handler,
 		},
@@ -457,6 +529,10 @@ var MessageBoard_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetMessages",
 			Handler:    _MessageBoard_GetMessages_Handler,
+		},
+		{
+			MethodName: "GetMessagesByUser",
+			Handler:    _MessageBoard_GetMessagesByUser_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

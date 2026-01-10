@@ -95,13 +95,14 @@ func main() {
 		fmt.Printf("\nWelcome, %s (ID: %d)!\n", client.currentUser.Name, client.currentUser.Id)
 		fmt.Println("Commands:")
 		fmt.Println("  1. create-topic <name>")
-		fmt.Println("  2. post <topic_id> <text>")
-		fmt.Println("  3. like <topic_id> <message_id>")
+		fmt.Println("  2. post <topic_name> <text>")
+		fmt.Println("  3. like <topic_name> <message_id>")
 		fmt.Println("  4. list-topics")
-		fmt.Println("  5. get-messages <topic_id> [from_id] [limit]")
-		fmt.Println("  6. subscribe <topic_id1> [topic_id2...]")
-		fmt.Println("  7. logout")
-		fmt.Println("  8. quit")
+		fmt.Println("  5. get-messages-after <topic_name> [from_id] [limit]")
+		fmt.Println("  6. get-messages-user <topic_name> <user_name> [limit]")
+		fmt.Println("  7. subscribe <topic_name1> [topic_name2...]")
+		fmt.Println("  8. logout")
+		fmt.Println("  9. quit")
 		fmt.Println()
 
 		// Command Loop
@@ -131,31 +132,31 @@ func main() {
 
 			case "post":
 				if len(args) < 2 {
-					fmt.Println("Usage: post <topic_id> <text>")
+					fmt.Println("Usage: post <topic_name> <text>")
 					continue
 				}
-				topicID, _ := strconv.ParseInt(args[0], 10, 64)
+				topicName := args[0]
 				text := strings.Join(args[1:], " ")
-				client.PostMessage(topicID, text)
+				client.PostMessage(topicName, text)
 
 			case "like":
 				if len(args) < 2 {
-					fmt.Println("Usage: like <topic_id> <message_id>")
+					fmt.Println("Usage: like <topic_name> <message_id>")
 					continue
 				}
-				topicID, _ := strconv.ParseInt(args[0], 10, 64)
+				topicName := args[0]
 				messageID, _ := strconv.ParseInt(args[1], 10, 64)
-				client.LikeMessage(topicID, messageID)
+				client.LikeMessage(topicName, messageID)
 
 			case "list-topics":
 				client.ListTopics()
 
-			case "get-messages":
+			case "get-messages-after":
 				if len(args) < 1 {
-					fmt.Println("Usage: get-messages <topic_id> [from_id] [limit]")
+					fmt.Println("Usage: get-messages-after <topic_name> [from_id] [limit]")
 					continue
 				}
-				topicID, _ := strconv.ParseInt(args[0], 10, 64)
+				topicName := args[0]
 				fromID := int64(0)
 				limit := int32(10)
 				if len(args) > 1 {
@@ -165,19 +166,28 @@ func main() {
 					l, _ := strconv.ParseInt(args[2], 10, 32)
 					limit = int32(l)
 				}
-				client.GetMessages(topicID, fromID, limit)
+				client.GetMessages(topicName, fromID, limit)
+
+			case "get-messages-user":
+				if len(args) < 2 {
+					fmt.Println("Usage: get-messages-user <topic_name> <user_name> [limit]")
+					continue
+				}
+				topicName := args[0]
+				userName := args[1]
+				limit := int32(10)
+				if len(args) > 2 {
+					l, _ := strconv.ParseInt(args[2], 10, 32)
+					limit = int32(l)
+				}
+				client.GetMessagesByUser(topicName, userName, limit)
 
 			case "subscribe":
 				if len(args) < 1 {
-					fmt.Println("Usage: subscribe <topic_id1> [topic_id2...]")
+					fmt.Println("Usage: subscribe <topic_name1> [topic_name2...]")
 					continue
 				}
-				topicIDs := make([]int64, 0)
-				for _, arg := range args {
-					tid, _ := strconv.ParseInt(arg, 10, 64)
-					topicIDs = append(topicIDs, tid)
-				}
-				client.Subscribe(topicIDs)
+				client.Subscribe(args)
 
 			case "logout":
 				client.currentUser = nil
@@ -269,7 +279,24 @@ func (c *Client) CreateTopic(name string) {
 	fmt.Printf("Created topic: ID=%d, Name=%s\n", topic.Id, topic.Name)
 }
 
-func (c *Client) PostMessage(topicID int64, text string) {
+func (c *Client) getTopicID(name string) (int64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	topic, err := c.tailClient.GetTopic(ctx, &pb.GetTopicRequest{Name: name})
+	if err != nil {
+		return 0, err
+	}
+	return topic.Id, nil
+}
+
+func (c *Client) PostMessage(topicName string, text string) {
+	topicID, err := c.getTopicID(topicName)
+	if err != nil {
+		fmt.Printf("Error finding topic '%s': %v\n", topicName, err)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -286,7 +313,13 @@ func (c *Client) PostMessage(topicID int64, text string) {
 	fmt.Printf("Posted message: ID=%d, User=%d, Likes=%d\n", msg.Id, msg.UserId, msg.Likes)
 }
 
-func (c *Client) LikeMessage(topicID, messageID int64) {
+func (c *Client) LikeMessage(topicName string, messageID int64) {
+	topicID, err := c.getTopicID(topicName)
+	if err != nil {
+		fmt.Printf("Error finding topic '%s': %v\n", topicName, err)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -319,7 +352,13 @@ func (c *Client) ListTopics() {
 	}
 }
 
-func (c *Client) GetMessages(topicID, fromID int64, limit int32) {
+func (c *Client) GetMessages(topicName string, fromID int64, limit int32) {
+	topicID, err := c.getTopicID(topicName)
+	if err != nil {
+		fmt.Printf("Error finding topic '%s': %v\n", topicName, err)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -333,13 +372,54 @@ func (c *Client) GetMessages(topicID, fromID int64, limit int32) {
 		return
 	}
 
-	fmt.Printf("Messages in topic %d:\n", topicID)
+	fmt.Printf("Messages in topic '%s' (ID: %d):\n", topicName, topicID)
 	for _, msg := range resp.Messages {
 		fmt.Printf("  [%d] User %d: %s (Likes: %d)\n", msg.Id, msg.UserId, msg.Text, msg.Likes)
 	}
 }
 
-func (c *Client) Subscribe(topicIDs []int64) {
+func (c *Client) GetMessagesByUser(topicName string, userName string, limit int32) {
+	topicID, err := c.getTopicID(topicName)
+	if err != nil {
+		fmt.Printf("Error finding topic '%s': %v\n", topicName, err)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp, err := c.tailClient.GetMessagesByUser(ctx, &pb.GetMessagesByUserRequest{
+		TopicId:  topicID,
+		UserName: userName,
+		Limit:    limit,
+	})
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Messages in topic '%s' (ID: %d) by user '%s':\n", topicName, topicID, userName)
+	for _, msg := range resp.Messages {
+		fmt.Printf("  [%d] User %d: %s (Likes: %d)\n", msg.Id, msg.UserId, msg.Text, msg.Likes)
+	}
+}
+
+func (c *Client) Subscribe(topicNames []string) {
+	topicIDs := make([]int64, 0)
+	for _, name := range topicNames {
+		tid, err := c.getTopicID(name)
+		if err != nil {
+			fmt.Printf("Warning: Could not find topic '%s', skipping. Error: %v\n", name, err)
+			continue
+		}
+		topicIDs = append(topicIDs, tid)
+	}
+
+	if len(topicIDs) == 0 {
+		fmt.Println("No valid topics to subscribe to.")
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -374,7 +454,7 @@ func (c *Client) Subscribe(topicIDs []int64) {
 		return
 	}
 
-	fmt.Printf("Subscribed to topics %v. Waiting for events (Ctrl+C to stop)...\n", topicIDs)
+	fmt.Printf("Subscribed to topics %v (IDs: %v). Waiting for events (Ctrl+C to stop)...\n", topicNames, topicIDs)
 
 	for {
 		event, err := stream.Recv()

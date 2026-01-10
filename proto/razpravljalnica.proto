@@ -58,11 +58,13 @@ service MessageBoard {
   rpc Login(LoginRequest) returns (User);
   rpc GetUser(GetUserRequest) returns (User);
   rpc CreateTopic(CreateTopicRequest) returns (Topic);
+  rpc GetTopic(GetTopicRequest) returns (Topic);
   rpc PostMessage(PostMessageRequest) returns (Message);
   rpc LikeMessage(LikeMessageRequest) returns (Message);
   rpc GetSubscriptionNode(SubscriptionNodeRequest) returns (SubscriptionNodeResponse);
   rpc ListTopics(google.protobuf.Empty) returns (ListTopicsResponse);
   rpc GetMessages(GetMessagesRequest) returns (GetMessagesResponse);
+  rpc GetMessagesByUser(GetMessagesByUserRequest) returns (GetMessagesResponse);
   rpc SubscribeTopic(SubscribeTopicRequest) returns (stream MessageEvent);
 }
 
@@ -85,6 +87,10 @@ message CreateTopicRequest {
   string name = 1;
 }
 
+message GetTopicRequest {
+  string name = 1;
+}
+
 message PostMessageRequest {
   int64 topic_id = 1;
   int64 user_id = 2;
@@ -104,6 +110,12 @@ message ListTopicsResponse {
 message GetMessagesRequest {
   int64 topic_id = 1;
   int64 from_message_id = 2;
+  int32 limit = 3;
+}
+
+message GetMessagesByUserRequest {
+  int64 topic_id = 1;
+  string user_name = 2;
   int32 limit = 3;
 }
 

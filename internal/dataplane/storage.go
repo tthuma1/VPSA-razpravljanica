@@ -47,7 +47,7 @@ func (s *Storage) initSchema() error {
 
 	CREATE TABLE IF NOT EXISTS topics (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		name TEXT NOT NULL
+		name TEXT NOT NULL UNIQUE
 	);
 
 	CREATE TABLE IF NOT EXISTS messages (
@@ -164,6 +164,16 @@ func (s *Storage) CreateTopic(name string) (*pb.Topic, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Check if topic already exists
+	var exists int
+	err := s.db.QueryRow("SELECT COUNT(*) FROM topics WHERE name = ?", name).Scan(&exists)
+	if err != nil {
+		return nil, err
+	}
+	if exists > 0 {
+		return nil, fmt.Errorf("topic with name '%s' already exists", name)
+	}
+
 	result, err := s.db.Exec("INSERT INTO topics (name) VALUES (?)", name)
 	if err != nil {
 		return nil, err
@@ -175,6 +185,22 @@ func (s *Storage) CreateTopic(name string) (*pb.Topic, error) {
 	}
 
 	return &pb.Topic{Id: id, Name: name}, nil
+}
+
+func (s *Storage) GetTopicByName(name string) (*pb.Topic, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var topic pb.Topic
+	err := s.db.QueryRow("SELECT id, name FROM topics WHERE name = ?", name).Scan(&topic.Id, &topic.Name)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil // Topic not found
+		}
+		return nil, err
+	}
+
+	return &topic, nil
 }
 
 func (s *Storage) PostMessage(topicID, userID int64, text string) (*pb.Message, error) {
@@ -295,6 +321,42 @@ func (s *Storage) GetMessages(topicID, fromMessageID int64, limit int32) ([]*pb.
 	rows, err := s.db.Query(
 		"SELECT id, topic_id, user_id, text, created_at, likes FROM messages WHERE topic_id = ? AND id >= ? ORDER BY id LIMIT ?",
 		topicID, fromMessageID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var messages []*pb.Message
+	for rows.Next() {
+		var msg pb.Message
+		var createdAt int64
+		if err := rows.Scan(&msg.Id, &msg.TopicId, &msg.UserId, &msg.Text, &createdAt, &msg.Likes); err != nil {
+			return nil, err
+		}
+		msg.CreatedAt = timestamppb.New(time.Unix(createdAt, 0))
+		messages = append(messages, &msg)
+	}
+
+	return messages, rows.Err()
+}
+
+func (s *Storage) GetMessagesByUser(topicID int64, userName string, limit int32) ([]*pb.Message, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// Get user ID first
+	user, err := s.GetUserByName(userName)
+	if err != nil {
+		return nil, err
+	}
+	if user == nil {
+		return nil, fmt.Errorf("user not found")
+	}
+
+	rows, err := s.db.Query(
+		"SELECT id, topic_id, user_id, text, created_at, likes FROM messages WHERE topic_id = ? AND user_id = ? ORDER BY id DESC LIMIT ?",
+		topicID, user.Id, limit,
 	)
 	if err != nil {
 		return nil, err

@@ -157,6 +157,23 @@ func (n *Node) CreateTopic(ctx context.Context, req *pb.CreateTopicRequest) (*pb
 	return topic, nil
 }
 
+func (n *Node) GetTopic(ctx context.Context, req *pb.GetTopicRequest) (*pb.Topic, error) {
+	// Reads go to Tail
+	if n.role != RoleTail {
+		return nil, fmt.Errorf("not the tail node")
+	}
+
+	topic, err := n.storage.GetTopicByName(req.Name)
+	if err != nil {
+		return nil, err
+	}
+	if topic == nil {
+		return nil, fmt.Errorf("topic not found")
+	}
+
+	return topic, nil
+}
+
 func (n *Node) PostMessage(ctx context.Context, req *pb.PostMessageRequest) (*pb.Message, error) {
 	if n.role != RoleHead {
 		return nil, fmt.Errorf("not the head node")
@@ -240,6 +257,19 @@ func (n *Node) GetMessages(ctx context.Context, req *pb.GetMessagesRequest) (*pb
 	}
 
 	messages, err := n.storage.GetMessages(req.TopicId, req.FromMessageId, req.Limit)
+	if err != nil {
+		return nil, err
+	}
+
+	return &pb.GetMessagesResponse{Messages: messages}, nil
+}
+
+func (n *Node) GetMessagesByUser(ctx context.Context, req *pb.GetMessagesByUserRequest) (*pb.GetMessagesResponse, error) {
+	if n.role != RoleTail {
+		return nil, fmt.Errorf("not the tail node")
+	}
+
+	messages, err := n.storage.GetMessagesByUser(req.TopicId, req.UserName, req.Limit)
 	if err != nil {
 		return nil, err
 	}
