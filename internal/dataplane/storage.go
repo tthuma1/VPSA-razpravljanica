@@ -160,6 +160,22 @@ func (s *Storage) GetUserByName(name string) (*pb.User, error) {
 	return &user, nil
 }
 
+func (s *Storage) GetUserById(id int64) (*pb.User, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var user pb.User
+	err := s.db.QueryRow("SELECT id, name, password_hash, salt FROM users WHERE id = ?", id).Scan(&user.Id, &user.Name, &user.PasswordHash, &user.Salt)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil // User not found
+		}
+		return nil, err
+	}
+
+	return &user, nil
+}
+
 func (s *Storage) CreateTopic(name string) (*pb.Topic, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

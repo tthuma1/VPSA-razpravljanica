@@ -137,6 +137,22 @@ func (n *Node) GetUser(ctx context.Context, req *pb.GetUserRequest) (*pb.User, e
 	return user, nil
 }
 
+func (n *Node) GetUserById(ctx context.Context, req *pb.GetUserByIdRequest) (*pb.User, error) {
+	if n.role != RoleTail {
+		return nil, fmt.Errorf("not the tail node")
+	}
+
+	user, err := n.storage.GetUserById(req.Id)
+	if err != nil {
+		return nil, err
+	}
+	if user == nil {
+		return nil, fmt.Errorf("user not found")
+	}
+
+	return user, nil
+}
+
 func (n *Node) CreateTopic(ctx context.Context, req *pb.CreateTopicRequest) (*pb.Topic, error) {
 	if n.role != RoleHead {
 		return nil, fmt.Errorf("not the head node")

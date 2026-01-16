@@ -57,6 +57,7 @@ service MessageBoard {
   rpc CreateUser(CreateUserRequest) returns (User);
   rpc Login(LoginRequest) returns (User);
   rpc GetUser(GetUserRequest) returns (User);
+  rpc GetUserById(GetUserByIdRequest) returns (User);
   rpc CreateTopic(CreateTopicRequest) returns (Topic);
   rpc GetTopic(GetTopicRequest) returns (Topic);
   rpc PostMessage(PostMessageRequest) returns (Message);
@@ -81,6 +82,10 @@ message LoginRequest {
 
 message GetUserRequest {
   string name = 1;
+}
+
+message GetUserByIdRequest {
+  int64 id = 1;
 }
 
 message CreateTopicRequest {
