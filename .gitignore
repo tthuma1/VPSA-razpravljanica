@@ -2,3 +2,4 @@
 *.pids
 bin/
 logs/
+.idea

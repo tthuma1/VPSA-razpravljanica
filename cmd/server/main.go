@@ -143,9 +143,18 @@ func updateRole(client pb.ControlPlaneClient, node *dataplane.Node) {
 		if len(chainState.Chain) > 1 {
 			nextNode = chainState.Chain[1].Address
 		}
-		node.SetRole(dataplane.RoleHead, nextNode)
+		node.SetRole(dataplane.RoleHead, nextNode, "")
 	} else if state.Tail.NodeId == node.NodeID() {
-		node.SetRole(dataplane.RoleTail, "")
+		chainState, err := client.GetChainState(ctx, &emptypb.Empty{})
+		if err != nil {
+			return
+		}
+
+		prevNode := ""
+		if len(chainState.Chain) > 1 {
+			prevNode = chainState.Chain[len(chainState.Chain)-2].Address
+		}
+		node.SetRole(dataplane.RoleTail, "", prevNode)
 	} else {
 		// Find next node in chain
 		chainState, err := client.GetChainState(ctx, &emptypb.Empty{})
@@ -154,12 +163,18 @@ func updateRole(client pb.ControlPlaneClient, node *dataplane.Node) {
 		}
 
 		nextNode := ""
+		prevNode := ""
 		for i, n := range chainState.Chain {
-			if n.NodeId == node.NodeID() && i < len(chainState.Chain)-1 {
-				nextNode = chainState.Chain[i+1].Address
+			if n.NodeId == node.NodeID() {
+				if i < len(chainState.Chain)-1 {
+					nextNode = chainState.Chain[i+1].Address
+				}
+				if i > 0 {
+					prevNode = chainState.Chain[i-1].Address
+				}
 				break
 			}
 		}
-		node.SetRole(dataplane.RoleMiddle, nextNode)
+		node.SetRole(dataplane.RoleMiddle, nextNode, prevNode)
 	}
 }

@@ -35,6 +35,7 @@ type Node struct {
 	storage     *Storage
 	role        NodeRole
 	nextNode    string // address of next node in chain
+	prevNode    string // address of previous node in chain
 	controlAddr string
 
 	// Subscription management
@@ -45,6 +46,10 @@ type Node struct {
 	// Event broadcast
 	eventListeners []chan *pb.MessageEvent
 	eventMu        sync.RWMutex
+
+	// Pending writes (Head only)
+	pendingWrites map[int64]chan error
+	pendingMu     sync.Mutex
 }
 
 type Subscription struct {
@@ -66,15 +71,17 @@ func NewNode(nodeID, address, dbPath, controlAddr string) (*Node, error) {
 		storage:       storage,
 		subscriptions: make(map[string]*Subscription),
 		controlAddr:   controlAddr,
+		pendingWrites: make(map[int64]chan error),
 	}
 
 	return node, nil
 }
 
-func (n *Node) SetRole(role NodeRole, nextNode string) {
+func (n *Node) SetRole(role NodeRole, nextNode, prevNode string) {
 	n.role = role
 	n.nextNode = nextNode
-	log.Printf("Node %s role set to %v, next node: %s", n.nodeID, role, nextNode)
+	n.prevNode = prevNode
+	log.Printf("Node %s role set to %v, next node: %s, prev node: %s", n.nodeID, role, nextNode, prevNode)
 }
 
 // Write operations (Head only)
@@ -93,10 +100,35 @@ func (n *Node) CreateUser(ctx context.Context, req *pb.CreateUserRequest) (*pb.U
 		// Update request with generated salt if it was empty
 		req.Salt = user.Salt
 
-		go n.replicateWrite(&pb.WriteOp{
+		seq := n.storage.NextSequence()
+		errChan := make(chan error, 1)
+		n.pendingMu.Lock()
+		n.pendingWrites[seq] = errChan
+		n.pendingMu.Unlock()
+
+		err := n.replicateWrite(ctx, &pb.WriteOp{
 			Operation: &pb.WriteOp_CreateUser{CreateUser: req},
-			Sequence:  n.storage.NextSequence(),
+			Sequence:  seq,
 		})
+		if err != nil {
+			n.pendingMu.Lock()
+			delete(n.pendingWrites, seq)
+			n.pendingMu.Unlock()
+			return nil, err
+		}
+
+		// Wait for acknowledgement
+		select {
+		case err := <-errChan:
+			if err != nil {
+				return nil, err
+			}
+		case <-ctx.Done():
+			n.pendingMu.Lock()
+			delete(n.pendingWrites, seq)
+			n.pendingMu.Unlock()
+			return nil, ctx.Err()
+		}
 	}
 
 	return user, nil
@@ -148,10 +180,35 @@ func (n *Node) CreateTopic(ctx context.Context, req *pb.CreateTopicRequest) (*pb
 	}
 
 	if n.nextNode != "" {
-		go n.replicateWrite(&pb.WriteOp{
+		seq := n.storage.NextSequence()
+		errChan := make(chan error, 1)
+		n.pendingMu.Lock()
+		n.pendingWrites[seq] = errChan
+		n.pendingMu.Unlock()
+
+		err := n.replicateWrite(ctx, &pb.WriteOp{
 			Operation: &pb.WriteOp_CreateTopic{CreateTopic: req},
-			Sequence:  n.storage.NextSequence(),
+			Sequence:  seq,
 		})
+		if err != nil {
+			n.pendingMu.Lock()
+			delete(n.pendingWrites, seq)
+			n.pendingMu.Unlock()
+			return nil, err
+		}
+
+		// Wait for acknowledgement
+		select {
+		case err := <-errChan:
+			if err != nil {
+				return nil, err
+			}
+		case <-ctx.Done():
+			n.pendingMu.Lock()
+			delete(n.pendingWrites, seq)
+			n.pendingMu.Unlock()
+			return nil, ctx.Err()
+		}
 	}
 
 	return topic, nil
@@ -196,11 +253,36 @@ func (n *Node) PostMessage(ctx context.Context, req *pb.PostMessageRequest) (*pb
 	n.broadcastEvent(event)
 
 	if n.nextNode != "" {
-		go n.replicateWrite(&pb.WriteOp{
+		go n.notifyEvent(event)
+
+		errChan := make(chan error, 1)
+		n.pendingMu.Lock()
+		n.pendingWrites[seq] = errChan
+		n.pendingMu.Unlock()
+
+		err := n.replicateWrite(ctx, &pb.WriteOp{
 			Operation: &pb.WriteOp_PostMessage{PostMessage: req},
 			Sequence:  seq,
 		})
-		go n.notifyEvent(event)
+		if err != nil {
+			n.pendingMu.Lock()
+			delete(n.pendingWrites, seq)
+			n.pendingMu.Unlock()
+			return nil, err
+		}
+
+		// Wait for acknowledgement
+		select {
+		case err := <-errChan:
+			if err != nil {
+				return nil, err
+			}
+		case <-ctx.Done():
+			n.pendingMu.Lock()
+			delete(n.pendingWrites, seq)
+			n.pendingMu.Unlock()
+			return nil, ctx.Err()
+		}
 	}
 
 	return msg, nil
@@ -227,11 +309,36 @@ func (n *Node) LikeMessage(ctx context.Context, req *pb.LikeMessageRequest) (*pb
 	n.broadcastEvent(event)
 
 	if n.nextNode != "" {
-		go n.replicateWrite(&pb.WriteOp{
+		go n.notifyEvent(event)
+
+		errChan := make(chan error, 1)
+		n.pendingMu.Lock()
+		n.pendingWrites[seq] = errChan
+		n.pendingMu.Unlock()
+
+		err := n.replicateWrite(ctx, &pb.WriteOp{
 			Operation: &pb.WriteOp_LikeMessage{LikeMessage: req},
 			Sequence:  seq,
 		})
-		go n.notifyEvent(event)
+		if err != nil {
+			n.pendingMu.Lock()
+			delete(n.pendingWrites, seq)
+			n.pendingMu.Unlock()
+			return nil, err
+		}
+
+		// Wait for acknowledgement
+		select {
+		case err := <-errChan:
+			if err != nil {
+				return nil, err
+			}
+		case <-ctx.Done():
+			n.pendingMu.Lock()
+			delete(n.pendingWrites, seq)
+			n.pendingMu.Unlock()
+			return nil, ctx.Err()
+		}
 	}
 
 	return msg, nil
@@ -374,7 +481,14 @@ func (n *Node) ReplicateWrite(ctx context.Context, req *pb.ReplicationRequest) (
 
 	// Forward to next node
 	if n.nextNode != "" && n.role != RoleTail {
-		go n.replicateWrite(op)
+		go func() {
+			if err := n.replicateWrite(context.Background(), op); err != nil {
+				log.Printf("Failed to replicate write: %v", err)
+			}
+		}()
+	} else if n.role == RoleTail {
+		// If we are the tail, we acknowledge the write to the previous node
+		go n.acknowledgeWrite(op.Sequence)
 	}
 
 	return &emptypb.Empty{}, nil
@@ -390,14 +504,53 @@ func (n *Node) NotifyEvent(ctx context.Context, event *pb.MessageEvent) (*emptyp
 	return &emptypb.Empty{}, nil
 }
 
-func (n *Node) replicateWrite(op *pb.WriteOp) {
+func (n *Node) AcknowledgeWrite(ctx context.Context, req *pb.AcknowledgeRequest) (*emptypb.Empty, error) {
+	if n.role == RoleHead {
+		n.pendingMu.Lock()
+		if ch, ok := n.pendingWrites[req.Sequence]; ok {
+			ch <- nil
+			delete(n.pendingWrites, req.Sequence)
+		}
+		n.pendingMu.Unlock()
+	} else {
+		// Propagate acknowledgement to previous node
+		go n.acknowledgeWrite(req.Sequence)
+	}
+	return &emptypb.Empty{}, nil
+}
+
+func (n *Node) replicateWrite(ctx context.Context, op *pb.WriteOp) error {
 	if n.nextNode == "" {
-		return
+		return nil
 	}
 
 	conn, err := grpc.NewClient(n.nextNode, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Printf("Failed to connect to next node: %v", err)
+		return err
+	}
+	defer conn.Close()
+
+	client := pb.NewReplicationClient(conn)
+	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	_, err = client.ReplicateWrite(reqCtx, &pb.ReplicationRequest{Op: op})
+	if err != nil {
+		log.Printf("Failed to replicate write: %v", err)
+		return err
+	}
+	return nil
+}
+
+func (n *Node) acknowledgeWrite(sequence int64) {
+	if n.prevNode == "" {
+		return
+	}
+
+	conn, err := grpc.NewClient(n.prevNode, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Printf("Failed to connect to prev node: %v", err)
 		return
 	}
 	defer conn.Close()
@@ -406,9 +559,9 @@ func (n *Node) replicateWrite(op *pb.WriteOp) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	_, err = client.ReplicateWrite(ctx, &pb.ReplicationRequest{Op: op})
+	_, err = client.AcknowledgeWrite(ctx, &pb.AcknowledgeRequest{Sequence: sequence})
 	if err != nil {
-		log.Printf("Failed to replicate write: %v", err)
+		log.Printf("Failed to acknowledge write: %v", err)
 	}
 }
 

@@ -184,6 +184,7 @@ service Replication {
   rpc ReplicateWrite(ReplicationRequest) returns (google.protobuf.Empty);
   rpc SyncState(google.protobuf.Empty) returns (StateSnapshot);
   rpc NotifyEvent(MessageEvent) returns (google.protobuf.Empty);
+  rpc AcknowledgeWrite(AcknowledgeRequest) returns (google.protobuf.Empty);
 }
 
 message ReplicationRequest {
@@ -206,4 +207,8 @@ message StateSnapshot {
   repeated Message messages = 3;
   repeated Like likes = 4;
   int64 last_sequence = 5;
+}
+
+message AcknowledgeRequest {
+  int64 sequence = 1;
 }
