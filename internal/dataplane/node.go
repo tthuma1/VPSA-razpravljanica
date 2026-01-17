@@ -47,9 +47,12 @@ type Node struct {
 	eventListeners []chan *pb.MessageEvent
 	eventMu        sync.RWMutex
 
-	// Pending writes (Head only)
+	// Pending writes (Head only) and Unacknowledged writes (All nodes except Tail)
+	// Map sequence number to:
+	// - Head: channel for waiting client
+	// - Middle: nil (just tracking existence for read consistency)
 	pendingWrites map[int64]chan error
-	pendingMu     sync.Mutex
+	pendingMu     sync.RWMutex
 }
 
 type Subscription struct {
@@ -136,9 +139,9 @@ func (n *Node) CreateUser(ctx context.Context, req *pb.CreateUserRequest) (*pb.U
 
 func (n *Node) Login(ctx context.Context, req *pb.LoginRequest) (*pb.User, error) {
 	// Login is a read operation but involves password verification.
-	// In chain replication, reads go to Tail.
-	if n.role != RoleTail {
-		return nil, fmt.Errorf("not the tail node")
+	// Check if we have unacknowledged writes. If so, forward to tail.
+	if n.role != RoleTail && n.hasPendingWrites() {
+		return n.forwardLoginToTail(ctx, req)
 	}
 
 	user, err := n.storage.VerifyUser(req.Name, req.Password)
@@ -150,12 +153,9 @@ func (n *Node) Login(ctx context.Context, req *pb.LoginRequest) (*pb.User, error
 }
 
 func (n *Node) GetUser(ctx context.Context, req *pb.GetUserRequest) (*pb.User, error) {
-	// Reads can be served by Tail (strong consistency) or Head (read-your-writes, though not strictly guaranteed here without more logic).
-	// For simplicity and consistency with other reads, let's enforce Tail.
-	// However, for login, we might want to check Head if we just created the user.
-	// But standard chain replication says reads go to Tail.
-	if n.role != RoleTail {
-		return nil, fmt.Errorf("not the tail node")
+	// Check if we have unacknowledged writes. If so, forward to tail.
+	if n.role != RoleTail && n.hasPendingWrites() {
+		return n.forwardGetUserToTail(ctx, req)
 	}
 
 	user, err := n.storage.GetUserByName(req.Name)
@@ -215,9 +215,9 @@ func (n *Node) CreateTopic(ctx context.Context, req *pb.CreateTopicRequest) (*pb
 }
 
 func (n *Node) GetTopic(ctx context.Context, req *pb.GetTopicRequest) (*pb.Topic, error) {
-	// Reads go to Tail
-	if n.role != RoleTail {
-		return nil, fmt.Errorf("not the tail node")
+	// Check if we have unacknowledged writes. If so, forward to tail.
+	if n.role != RoleTail && n.hasPendingWrites() {
+		return n.forwardGetTopicToTail(ctx, req)
 	}
 
 	topic, err := n.storage.GetTopicByName(req.Name)
@@ -344,10 +344,11 @@ func (n *Node) LikeMessage(ctx context.Context, req *pb.LikeMessageRequest) (*pb
 	return msg, nil
 }
 
-// Read operations (Tail only)
+// Read operations
 func (n *Node) ListTopics(ctx context.Context, _ *emptypb.Empty) (*pb.ListTopicsResponse, error) {
-	if n.role != RoleTail {
-		return nil, fmt.Errorf("not the tail node")
+	// Check if we have unacknowledged writes. If so, forward to tail.
+	if n.role != RoleTail && n.hasPendingWrites() {
+		return n.forwardListTopicsToTail(ctx)
 	}
 
 	topics, err := n.storage.ListTopics()
@@ -359,8 +360,9 @@ func (n *Node) ListTopics(ctx context.Context, _ *emptypb.Empty) (*pb.ListTopics
 }
 
 func (n *Node) GetMessages(ctx context.Context, req *pb.GetMessagesRequest) (*pb.GetMessagesResponse, error) {
-	if n.role != RoleTail {
-		return nil, fmt.Errorf("not the tail node")
+	// Check if we have unacknowledged writes. If so, forward to tail.
+	if n.role != RoleTail && n.hasPendingWrites() {
+		return n.forwardGetMessagesToTail(ctx, req)
 	}
 
 	messages, err := n.storage.GetMessages(req.TopicId, req.FromMessageId, req.Limit)
@@ -372,8 +374,9 @@ func (n *Node) GetMessages(ctx context.Context, req *pb.GetMessagesRequest) (*pb
 }
 
 func (n *Node) GetMessagesByUser(ctx context.Context, req *pb.GetMessagesByUserRequest) (*pb.GetMessagesResponse, error) {
-	if n.role != RoleTail {
-		return nil, fmt.Errorf("not the tail node")
+	// Check if we have unacknowledged writes. If so, forward to tail.
+	if n.role != RoleTail && n.hasPendingWrites() {
+		return n.forwardGetMessagesByUserToTail(ctx, req)
 	}
 
 	messages, err := n.storage.GetMessagesByUser(req.TopicId, req.UserName, req.Limit)
@@ -456,6 +459,20 @@ func (n *Node) SubscribeTopic(req *pb.SubscribeTopicRequest, stream pb.MessageBo
 func (n *Node) ReplicateWrite(ctx context.Context, req *pb.ReplicationRequest) (*emptypb.Empty, error) {
 	op := req.Op
 
+	// Mark as unacknowledged before processing
+	if n.role != RoleTail {
+		n.pendingMu.Lock()
+		// For middle nodes, we just need to track existence, so nil channel is fine
+		// unless we are Head, but Head handles this in the initial write method.
+		// However, ReplicateWrite is called on Head too? No, Head initiates it.
+		// ReplicateWrite is called on Middle and Tail nodes.
+		// So for Middle nodes, we just insert nil.
+		if _, exists := n.pendingWrites[op.Sequence]; !exists {
+			n.pendingWrites[op.Sequence] = nil
+		}
+		n.pendingMu.Unlock()
+	}
+
 	switch o := op.Operation.(type) {
 	case *pb.WriteOp_CreateUser:
 		_, err := n.storage.CreateUser(o.CreateUser.Name, o.CreateUser.Password, o.CreateUser.Salt)
@@ -505,13 +522,15 @@ func (n *Node) NotifyEvent(ctx context.Context, event *pb.MessageEvent) (*emptyp
 }
 
 func (n *Node) AcknowledgeWrite(ctx context.Context, req *pb.AcknowledgeRequest) (*emptypb.Empty, error) {
+	n.pendingMu.Lock()
+	ch, exists := n.pendingWrites[req.Sequence]
+	delete(n.pendingWrites, req.Sequence)
+	n.pendingMu.Unlock()
+
 	if n.role == RoleHead {
-		n.pendingMu.Lock()
-		if ch, ok := n.pendingWrites[req.Sequence]; ok {
+		if exists && ch != nil {
 			ch <- nil
-			delete(n.pendingWrites, req.Sequence)
 		}
-		n.pendingMu.Unlock()
 	} else {
 		// Propagate acknowledgement to previous node
 		go n.acknowledgeWrite(req.Sequence)
@@ -618,4 +637,95 @@ func (n *Node) Close() {
 
 func (n *Node) NodeID() string {
 	return n.nodeID
+}
+
+func (n *Node) hasPendingWrites() bool {
+	n.pendingMu.RLock()
+	defer n.pendingMu.RUnlock()
+	return len(n.pendingWrites) > 0
+}
+
+// Forwarding methods
+func (n *Node) forwardLoginToTail(ctx context.Context, req *pb.LoginRequest) (*pb.User, error) {
+	client, conn, err := n.getTailClient()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	return client.Login(ctx, req)
+}
+
+func (n *Node) forwardGetUserToTail(ctx context.Context, req *pb.GetUserRequest) (*pb.User, error) {
+	client, conn, err := n.getTailClient()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	return client.GetUser(ctx, req)
+}
+
+func (n *Node) forwardGetTopicToTail(ctx context.Context, req *pb.GetTopicRequest) (*pb.Topic, error) {
+	client, conn, err := n.getTailClient()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	return client.GetTopic(ctx, req)
+}
+
+func (n *Node) forwardListTopicsToTail(ctx context.Context) (*pb.ListTopicsResponse, error) {
+	client, conn, err := n.getTailClient()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	return client.ListTopics(ctx, &emptypb.Empty{})
+}
+
+func (n *Node) forwardGetMessagesToTail(ctx context.Context, req *pb.GetMessagesRequest) (*pb.GetMessagesResponse, error) {
+	client, conn, err := n.getTailClient()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	return client.GetMessages(ctx, req)
+}
+
+func (n *Node) forwardGetMessagesByUserToTail(ctx context.Context, req *pb.GetMessagesByUserRequest) (*pb.GetMessagesResponse, error) {
+	client, conn, err := n.getTailClient()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	return client.GetMessagesByUser(ctx, req)
+}
+
+func (n *Node) getTailClient() (pb.MessageBoardClient, *grpc.ClientConn, error) {
+	// We need to find the tail node. We can ask the control plane.
+	conn, err := grpc.NewClient(n.controlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to connect to control plane: %v", err)
+	}
+	// Don't close control plane conn here, we need it for the request
+
+	cpClient := pb.NewControlPlaneClient(conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	state, err := cpClient.GetClusterState(ctx, &emptypb.Empty{})
+	cancel()
+	conn.Close() // Close control plane connection
+
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get cluster state: %v", err)
+	}
+
+	if state.Tail == nil {
+		return nil, nil, fmt.Errorf("tail node not found")
+	}
+
+	tailConn, err := grpc.NewClient(state.Tail.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to connect to tail node: %v", err)
+	}
+
+	return pb.NewMessageBoardClient(tailConn), tailConn, nil
 }
