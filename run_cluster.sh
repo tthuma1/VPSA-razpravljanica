@@ -8,7 +8,7 @@ echo "Starting control plane and 3 data nodes..."
 echo ""
 
 # Clean up old databases
-rm -f *.db 2>/dev/null || true
+#rm -f *.db 2>/dev/null || true
 
 # Check if binaries exist
 if [ ! -f "bin/controlplane" ] || [ ! -f "bin/server" ]; then

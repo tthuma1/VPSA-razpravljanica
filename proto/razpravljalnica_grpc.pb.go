@@ -550,6 +550,7 @@ const (
 	ControlPlane_RegisterNode_FullMethodName    = "/razpravljalnica.ControlPlane/RegisterNode"
 	ControlPlane_Heartbeat_FullMethodName       = "/razpravljalnica.ControlPlane/Heartbeat"
 	ControlPlane_GetChainState_FullMethodName   = "/razpravljalnica.ControlPlane/GetChainState"
+	ControlPlane_ConfirmSynced_FullMethodName   = "/razpravljalnica.ControlPlane/ConfirmSynced"
 )
 
 // ControlPlaneClient is the client API for ControlPlane service.
@@ -560,6 +561,7 @@ type ControlPlaneClient interface {
 	RegisterNode(ctx context.Context, in *RegisterNodeRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	GetChainState(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*ChainStateResponse, error)
+	ConfirmSynced(ctx context.Context, in *ConfirmSyncedRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 }
 
 type controlPlaneClient struct {
@@ -610,6 +612,16 @@ func (c *controlPlaneClient) GetChainState(ctx context.Context, in *emptypb.Empt
 	return out, nil
 }
 
+func (c *controlPlaneClient) ConfirmSynced(ctx context.Context, in *ConfirmSyncedRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, ControlPlane_ConfirmSynced_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ControlPlaneServer is the server API for ControlPlane service.
 // All implementations must embed UnimplementedControlPlaneServer
 // for forward compatibility.
@@ -618,6 +630,7 @@ type ControlPlaneServer interface {
 	RegisterNode(context.Context, *RegisterNodeRequest) (*emptypb.Empty, error)
 	Heartbeat(context.Context, *HeartbeatRequest) (*emptypb.Empty, error)
 	GetChainState(context.Context, *emptypb.Empty) (*ChainStateResponse, error)
+	ConfirmSynced(context.Context, *ConfirmSyncedRequest) (*emptypb.Empty, error)
 	mustEmbedUnimplementedControlPlaneServer()
 }
 
@@ -639,6 +652,9 @@ func (UnimplementedControlPlaneServer) Heartbeat(context.Context, *HeartbeatRequ
 }
 func (UnimplementedControlPlaneServer) GetChainState(context.Context, *emptypb.Empty) (*ChainStateResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetChainState not implemented")
+}
+func (UnimplementedControlPlaneServer) ConfirmSynced(context.Context, *ConfirmSyncedRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method ConfirmSynced not implemented")
 }
 func (UnimplementedControlPlaneServer) mustEmbedUnimplementedControlPlaneServer() {}
 func (UnimplementedControlPlaneServer) testEmbeddedByValue()                      {}
@@ -733,6 +749,24 @@ func _ControlPlane_GetChainState_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ControlPlane_ConfirmSynced_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ConfirmSyncedRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlPlaneServer).ConfirmSynced(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlPlane_ConfirmSynced_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlPlaneServer).ConfirmSynced(ctx, req.(*ConfirmSyncedRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ControlPlane_ServiceDesc is the grpc.ServiceDesc for ControlPlane service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -756,6 +790,10 @@ var ControlPlane_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "GetChainState",
 			Handler:    _ControlPlane_GetChainState_Handler,
 		},
+		{
+			MethodName: "ConfirmSynced",
+			Handler:    _ControlPlane_ConfirmSynced_Handler,
+		},
 	},
 	Streams:  []grpc.StreamDesc{},
 	Metadata: "proto/razpravljalnica.proto",
@@ -763,7 +801,7 @@ var ControlPlane_ServiceDesc = grpc.ServiceDesc{
 
 const (
 	Replication_ReplicateWrite_FullMethodName   = "/razpravljalnica.Replication/ReplicateWrite"
-	Replication_SyncState_FullMethodName        = "/razpravljalnica.Replication/SyncState"
+	Replication_StreamLog_FullMethodName        = "/razpravljalnica.Replication/StreamLog"
 	Replication_NotifyEvent_FullMethodName      = "/razpravljalnica.Replication/NotifyEvent"
 	Replication_AcknowledgeWrite_FullMethodName = "/razpravljalnica.Replication/AcknowledgeWrite"
 )
@@ -773,7 +811,7 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type ReplicationClient interface {
 	ReplicateWrite(ctx context.Context, in *ReplicationRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
-	SyncState(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*StateSnapshot, error)
+	StreamLog(ctx context.Context, in *StreamLogRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[WriteOp], error)
 	NotifyEvent(ctx context.Context, in *MessageEvent, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	AcknowledgeWrite(ctx context.Context, in *AcknowledgeRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 }
@@ -796,15 +834,24 @@ func (c *replicationClient) ReplicateWrite(ctx context.Context, in *ReplicationR
 	return out, nil
 }
 
-func (c *replicationClient) SyncState(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*StateSnapshot, error) {
+func (c *replicationClient) StreamLog(ctx context.Context, in *StreamLogRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[WriteOp], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(StateSnapshot)
-	err := c.cc.Invoke(ctx, Replication_SyncState_FullMethodName, in, out, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &Replication_ServiceDesc.Streams[0], Replication_StreamLog_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
-	return out, nil
+	x := &grpc.GenericClientStream[StreamLogRequest, WriteOp]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
 }
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Replication_StreamLogClient = grpc.ServerStreamingClient[WriteOp]
 
 func (c *replicationClient) NotifyEvent(ctx context.Context, in *MessageEvent, opts ...grpc.CallOption) (*emptypb.Empty, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
@@ -831,7 +878,7 @@ func (c *replicationClient) AcknowledgeWrite(ctx context.Context, in *Acknowledg
 // for forward compatibility.
 type ReplicationServer interface {
 	ReplicateWrite(context.Context, *ReplicationRequest) (*emptypb.Empty, error)
-	SyncState(context.Context, *emptypb.Empty) (*StateSnapshot, error)
+	StreamLog(*StreamLogRequest, grpc.ServerStreamingServer[WriteOp]) error
 	NotifyEvent(context.Context, *MessageEvent) (*emptypb.Empty, error)
 	AcknowledgeWrite(context.Context, *AcknowledgeRequest) (*emptypb.Empty, error)
 	mustEmbedUnimplementedReplicationServer()
@@ -847,8 +894,8 @@ type UnimplementedReplicationServer struct{}
 func (UnimplementedReplicationServer) ReplicateWrite(context.Context, *ReplicationRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReplicateWrite not implemented")
 }
-func (UnimplementedReplicationServer) SyncState(context.Context, *emptypb.Empty) (*StateSnapshot, error) {
-	return nil, status.Error(codes.Unimplemented, "method SyncState not implemented")
+func (UnimplementedReplicationServer) StreamLog(*StreamLogRequest, grpc.ServerStreamingServer[WriteOp]) error {
+	return status.Error(codes.Unimplemented, "method StreamLog not implemented")
 }
 func (UnimplementedReplicationServer) NotifyEvent(context.Context, *MessageEvent) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method NotifyEvent not implemented")
@@ -895,23 +942,16 @@ func _Replication_ReplicateWrite_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
-func _Replication_SyncState_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(emptypb.Empty)
-	if err := dec(in); err != nil {
-		return nil, err
+func _Replication_StreamLog_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(StreamLogRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
 	}
-	if interceptor == nil {
-		return srv.(ReplicationServer).SyncState(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: Replication_SyncState_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(ReplicationServer).SyncState(ctx, req.(*emptypb.Empty))
-	}
-	return interceptor(ctx, in, info, handler)
+	return srv.(ReplicationServer).StreamLog(m, &grpc.GenericServerStream[StreamLogRequest, WriteOp]{ServerStream: stream})
 }
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Replication_StreamLogServer = grpc.ServerStreamingServer[WriteOp]
 
 func _Replication_NotifyEvent_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(MessageEvent)
@@ -961,10 +1001,6 @@ var Replication_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Replication_ReplicateWrite_Handler,
 		},
 		{
-			MethodName: "SyncState",
-			Handler:    _Replication_SyncState_Handler,
-		},
-		{
 			MethodName: "NotifyEvent",
 			Handler:    _Replication_NotifyEvent_Handler,
 		},
@@ -973,6 +1009,12 @@ var Replication_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Replication_AcknowledgeWrite_Handler,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "StreamLog",
+			Handler:       _Replication_StreamLog_Handler,
+			ServerStreams: true,
+		},
+	},
 	Metadata: "proto/razpravljalnica.proto",
 }

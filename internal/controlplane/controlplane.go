@@ -26,6 +26,7 @@ type NodeState struct {
 	Info     *pb.NodeInfo
 	Healthy  bool
 	JoinedAt time.Time
+	Syncing  bool
 }
 
 func NewControlPlane() *ControlPlane {
@@ -50,10 +51,12 @@ func (cp *ControlPlane) RegisterNode(ctx context.Context, req *pb.RegisterNodeRe
 		Address: req.Address,
 	}
 
+	isFirst := len(cp.chain) == 0
 	cp.nodes[req.NodeId] = &NodeState{
 		Info:     nodeInfo,
 		Healthy:  true,
 		JoinedAt: time.Now(),
+		Syncing:  !isFirst,
 	}
 
 	cp.lastHeartbeat[req.NodeId] = time.Now()
@@ -103,6 +106,17 @@ func (cp *ControlPlane) GetChainState(ctx context.Context, _ *emptypb.Empty) (*p
 	}, nil
 }
 
+func (cp *ControlPlane) ConfirmSynced(ctx context.Context, req *pb.ConfirmSyncedRequest) (*emptypb.Empty, error) {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+
+	if state, exists := cp.nodes[req.NodeId]; exists {
+		state.Syncing = false
+		log.Printf("Node %s confirmed synced", req.NodeId)
+	}
+	return &emptypb.Empty{}, nil
+}
+
 func (cp *ControlPlane) monitorHealth() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -120,7 +134,7 @@ func (cp *ControlPlane) checkHealth() {
 	healthChanged := false
 
 	for nodeID, lastHB := range cp.lastHeartbeat {
-		if now.Sub(lastHB) > 15*time.Second {
+		if now.Sub(lastHB) > 5*time.Second {
 			if state, exists := cp.nodes[nodeID]; exists && state.Healthy {
 				log.Printf("Node %s marked unhealthy", nodeID)
 				state.Healthy = false
