@@ -24,10 +24,13 @@ var (
 )
 
 type Client struct {
-	headConn    *grpc.ClientConn
-	tailConn    *grpc.ClientConn
-	headClient  pb.MessageBoardClient
-	tailClient  pb.MessageBoardClient
+	headConn   *grpc.ClientConn
+	headClient pb.MessageBoardClient
+
+	readConns   []*grpc.ClientConn
+	readClients []pb.MessageBoardClient
+	readIndex   int
+
 	currentUser *pb.User
 }
 
@@ -215,27 +218,51 @@ func (c *Client) Connect(controlAddr string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	state, err := client.GetClusterState(ctx, &emptypb.Empty{})
+	state, err := client.GetChainState(ctx, &emptypb.Empty{})
 	if err != nil {
-		return fmt.Errorf("failed to get cluster state: %w", err)
+		return fmt.Errorf("failed to get chain state: %w", err)
+	}
+
+	if len(state.Chain) == 0 {
+		return fmt.Errorf("chain is empty")
 	}
 
 	// Connect to head
-	c.headConn, err = grpc.NewClient(state.Head.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	c.headConn, err = grpc.NewClient(state.Chain[0].Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return fmt.Errorf("failed to connect to head: %w", err)
 	}
 	c.headClient = pb.NewMessageBoardClient(c.headConn)
 
-	// Connect to tail
-	c.tailConn, err = grpc.NewClient(state.Tail.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return fmt.Errorf("failed to connect to tail: %w", err)
-	}
-	c.tailClient = pb.NewMessageBoardClient(c.tailConn)
+	// Connect to all nodes for reading
+	c.readConns = make([]*grpc.ClientConn, 0, len(state.Chain))
+	c.readClients = make([]pb.MessageBoardClient, 0, len(state.Chain))
 
-	fmt.Printf("Connected to head: %s, tail: %s\n", state.Head.Address, state.Tail.Address)
+	for _, node := range state.Chain {
+		conn, err := grpc.NewClient(node.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			fmt.Printf("Warning: failed to connect to node %s: %v\n", node.Address, err)
+			continue
+		}
+		c.readConns = append(c.readConns, conn)
+		c.readClients = append(c.readClients, pb.NewMessageBoardClient(conn))
+	}
+
+	if len(c.readClients) == 0 {
+		return fmt.Errorf("failed to connect to any nodes")
+	}
+
+	fmt.Printf("Connected to head: %s, and %d read nodes\n", state.Chain[0].Address, len(c.readClients))
 	return nil
+}
+
+func (c *Client) getReadClient() pb.MessageBoardClient {
+	if len(c.readClients) == 0 {
+		return c.headClient
+	}
+	client := c.readClients[c.readIndex]
+	c.readIndex = (c.readIndex + 1) % len(c.readClients)
+	return client
 }
 
 func (c *Client) RegisterUser(name, password string) {
@@ -256,7 +283,7 @@ func (c *Client) LoginUser(name, password string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	user, err := c.tailClient.Login(ctx, &pb.LoginRequest{Name: name, Password: password})
+	user, err := c.getReadClient().Login(ctx, &pb.LoginRequest{Name: name, Password: password})
 	if err != nil {
 		fmt.Printf("Error logging in: %v\n", err)
 		return
@@ -283,7 +310,7 @@ func (c *Client) getTopicID(name string) (int64, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	topic, err := c.tailClient.GetTopic(ctx, &pb.GetTopicRequest{Name: name})
+	topic, err := c.getReadClient().GetTopic(ctx, &pb.GetTopicRequest{Name: name})
 	if err != nil {
 		return 0, err
 	}
@@ -340,7 +367,7 @@ func (c *Client) ListTopics() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	resp, err := c.tailClient.ListTopics(ctx, &emptypb.Empty{})
+	resp, err := c.getReadClient().ListTopics(ctx, &emptypb.Empty{})
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
 		return
@@ -362,7 +389,7 @@ func (c *Client) GetMessages(topicName string, fromID int64, limit int32) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	resp, err := c.tailClient.GetMessages(ctx, &pb.GetMessagesRequest{
+	resp, err := c.getReadClient().GetMessages(ctx, &pb.GetMessagesRequest{
 		TopicId:       topicID,
 		FromMessageId: fromID,
 		Limit:         limit,
@@ -388,7 +415,7 @@ func (c *Client) GetMessagesByUser(topicName string, userName string, limit int3
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	resp, err := c.tailClient.GetMessagesByUser(ctx, &pb.GetMessagesByUserRequest{
+	resp, err := c.getReadClient().GetMessagesByUser(ctx, &pb.GetMessagesByUserRequest{
 		TopicId:  topicID,
 		UserName: userName,
 		Limit:    limit,
@@ -478,7 +505,7 @@ func (c *Client) Close() {
 	if c.headConn != nil {
 		c.headConn.Close()
 	}
-	if c.tailConn != nil {
-		c.tailConn.Close()
+	for _, conn := range c.readConns {
+		conn.Close()
 	}
 }
