@@ -24,6 +24,8 @@ var (
 )
 
 type Client struct {
+	controlAddr string
+
 	headConn   *grpc.ClientConn
 	headClient pb.MessageBoardClient
 
@@ -208,7 +210,12 @@ func main() {
 }
 
 func (c *Client) Connect(controlAddr string) error {
-	conn, err := grpc.NewClient(controlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	c.controlAddr = controlAddr
+	return c.RefreshTopology()
+}
+
+func (c *Client) RefreshTopology() error {
+	conn, err := grpc.NewClient(c.controlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return fmt.Errorf("failed to connect to control plane: %w", err)
 	}
@@ -226,6 +233,9 @@ func (c *Client) Connect(controlAddr string) error {
 	if len(state.Chain) == 0 {
 		return fmt.Errorf("chain is empty")
 	}
+
+	// Close existing connections
+	c.Close()
 
 	// Connect to head
 	c.headConn, err = grpc.NewClient(state.Chain[0].Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -252,8 +262,23 @@ func (c *Client) Connect(controlAddr string) error {
 		return fmt.Errorf("failed to connect to any nodes")
 	}
 
-	fmt.Printf("Connected to head: %s, and %d read nodes\n", state.Chain[0].Address, len(c.readClients))
+	c.readIndex = 0
+	fmt.Printf("Topology refreshed. Head: %s, Read nodes: %d\n", state.Chain[0].Address, len(c.readClients))
 	return nil
+}
+
+func (c *Client) Close() {
+	if c.headConn != nil {
+		c.headConn.Close()
+		c.headConn = nil
+	}
+	c.headClient = nil
+
+	for _, conn := range c.readConns {
+		conn.Close()
+	}
+	c.readConns = nil
+	c.readClients = nil
 }
 
 func (c *Client) getReadClient() pb.MessageBoardClient {
@@ -265,45 +290,68 @@ func (c *Client) getReadClient() pb.MessageBoardClient {
 	return client
 }
 
-func (c *Client) RegisterUser(name, password string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	user, err := c.headClient.CreateUser(ctx, &pb.CreateUserRequest{Name: name, Password: password})
-	if err != nil {
-		fmt.Printf("Error registering: %v\n", err)
+func (c *Client) withRetry(op func() error) {
+	err := op()
+	if err == nil {
 		return
 	}
 
-	c.currentUser = user
-	fmt.Printf("Registered successfully: ID=%d, Name=%s\n", user.Id, user.Name)
+	fmt.Printf("Operation failed: %v. Refreshing topology...\n", err)
+	if refreshErr := c.RefreshTopology(); refreshErr != nil {
+		fmt.Printf("Failed to refresh topology: %v\n", refreshErr)
+		return
+	}
+
+	if err := op(); err != nil {
+		fmt.Printf("Operation failed after retry: %v\n", err)
+	}
+}
+
+func (c *Client) RegisterUser(name, password string) {
+	c.withRetry(func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		user, err := c.headClient.CreateUser(ctx, &pb.CreateUserRequest{Name: name, Password: password})
+		if err != nil {
+			return err
+		}
+
+		c.currentUser = user
+		fmt.Printf("Registered successfully: ID=%d, Name=%s\n", user.Id, user.Name)
+		return nil
+	})
 }
 
 func (c *Client) LoginUser(name, password string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	c.withRetry(func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 
-	user, err := c.getReadClient().Login(ctx, &pb.LoginRequest{Name: name, Password: password})
-	if err != nil {
-		fmt.Printf("Error logging in: %v\n", err)
-		return
-	}
+		user, err := c.getReadClient().Login(ctx, &pb.LoginRequest{Name: name, Password: password})
+		if err != nil {
+			return err
+		}
 
-	c.currentUser = user
-	fmt.Printf("Logged in successfully: ID=%d, Name=%s\n", user.Id, user.Name)
+		c.currentUser = user
+		fmt.Printf("Logged in successfully: ID=%d, Name=%s\n", user.Id, user.Name)
+		return nil
+	})
 }
 
 func (c *Client) CreateTopic(name string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	c.withRetry(func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 
-	topic, err := c.headClient.CreateTopic(ctx, &pb.CreateTopicRequest{Name: name})
-	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-		return
-	}
+		topic, err := c.headClient.CreateTopic(ctx, &pb.CreateTopicRequest{Name: name})
+		if err != nil {
+			return err
+		}
 
-	fmt.Printf("Created topic: ID=%d, Name=%s\n", topic.Id, topic.Name)
+		fmt.Printf("Created topic: ID=%d, Name=%s\n", topic.Id, topic.Name)
+		return nil
+	})
 }
 
 func (c *Client) getTopicID(name string) (int64, error) {
@@ -318,133 +366,157 @@ func (c *Client) getTopicID(name string) (int64, error) {
 }
 
 func (c *Client) PostMessage(topicName string, text string) {
-	topicID, err := c.getTopicID(topicName)
-	if err != nil {
-		fmt.Printf("Error finding topic '%s': %v\n", topicName, err)
-		return
-	}
+	c.withRetry(func() error {
+		topicID, err := c.getTopicID(topicName)
+		if err != nil {
+			return fmt.Errorf("finding topic '%s': %w", topicName, err)
+		}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 
-	msg, err := c.headClient.PostMessage(ctx, &pb.PostMessageRequest{
-		TopicId: topicID,
-		UserId:  c.currentUser.Id,
-		Text:    text,
+		msg, err := c.headClient.PostMessage(ctx, &pb.PostMessageRequest{
+			TopicId: topicID,
+			UserId:  c.currentUser.Id,
+			Text:    text,
+		})
+		if err != nil {
+			return err
+		}
+
+		fmt.Printf("Posted message: ID=%d, User=%d, Likes=%d\n", msg.Id, msg.UserId, msg.Likes)
+		return nil
 	})
-	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-		return
-	}
-
-	fmt.Printf("Posted message: ID=%d, User=%d, Likes=%d\n", msg.Id, msg.UserId, msg.Likes)
 }
 
 func (c *Client) LikeMessage(topicName string, messageID int64) {
-	topicID, err := c.getTopicID(topicName)
-	if err != nil {
-		fmt.Printf("Error finding topic '%s': %v\n", topicName, err)
-		return
-	}
+	c.withRetry(func() error {
+		topicID, err := c.getTopicID(topicName)
+		if err != nil {
+			return fmt.Errorf("finding topic '%s': %w", topicName, err)
+		}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 
-	msg, err := c.headClient.LikeMessage(ctx, &pb.LikeMessageRequest{
-		TopicId:   topicID,
-		MessageId: messageID,
-		UserId:    c.currentUser.Id,
+		msg, err := c.headClient.LikeMessage(ctx, &pb.LikeMessageRequest{
+			TopicId:   topicID,
+			MessageId: messageID,
+			UserId:    c.currentUser.Id,
+		})
+		if err != nil {
+			return err
+		}
+
+		fmt.Printf("Liked message: ID=%d, Likes=%d\n", msg.Id, msg.Likes)
+		return nil
 	})
-	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-		return
-	}
-
-	fmt.Printf("Liked message: ID=%d, Likes=%d\n", msg.Id, msg.Likes)
 }
 
 func (c *Client) ListTopics() {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	c.withRetry(func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 
-	resp, err := c.getReadClient().ListTopics(ctx, &emptypb.Empty{})
-	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-		return
-	}
+		resp, err := c.getReadClient().ListTopics(ctx, &emptypb.Empty{})
+		if err != nil {
+			return err
+		}
 
-	fmt.Println("Topics:")
-	for _, topic := range resp.Topics {
-		fmt.Printf("  [%d] %s\n", topic.Id, topic.Name)
-	}
+		fmt.Println("Topics:")
+		for _, topic := range resp.Topics {
+			fmt.Printf("  [%d] %s\n", topic.Id, topic.Name)
+		}
+		return nil
+	})
 }
 
 func (c *Client) GetMessages(topicName string, fromID int64, limit int32) {
-	topicID, err := c.getTopicID(topicName)
-	if err != nil {
-		fmt.Printf("Error finding topic '%s': %v\n", topicName, err)
-		return
-	}
+	c.withRetry(func() error {
+		topicID, err := c.getTopicID(topicName)
+		if err != nil {
+			return fmt.Errorf("finding topic '%s': %w", topicName, err)
+		}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 
-	resp, err := c.getReadClient().GetMessages(ctx, &pb.GetMessagesRequest{
-		TopicId:       topicID,
-		FromMessageId: fromID,
-		Limit:         limit,
+		resp, err := c.getReadClient().GetMessages(ctx, &pb.GetMessagesRequest{
+			TopicId:       topicID,
+			FromMessageId: fromID,
+			Limit:         limit,
+		})
+		if err != nil {
+			return err
+		}
+
+		fmt.Printf("Messages in topic '%s' (ID: %d):\n", topicName, topicID)
+		for _, msg := range resp.Messages {
+			fmt.Printf("  [%d] User %d: %s (Likes: %d)\n", msg.Id, msg.UserId, msg.Text, msg.Likes)
+		}
+		return nil
 	})
-	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-		return
-	}
-
-	fmt.Printf("Messages in topic '%s' (ID: %d):\n", topicName, topicID)
-	for _, msg := range resp.Messages {
-		fmt.Printf("  [%d] User %d: %s (Likes: %d)\n", msg.Id, msg.UserId, msg.Text, msg.Likes)
-	}
 }
 
 func (c *Client) GetMessagesByUser(topicName string, userName string, limit int32) {
-	topicID, err := c.getTopicID(topicName)
-	if err != nil {
-		fmt.Printf("Error finding topic '%s': %v\n", topicName, err)
-		return
-	}
+	c.withRetry(func() error {
+		topicID, err := c.getTopicID(topicName)
+		if err != nil {
+			return fmt.Errorf("finding topic '%s': %w", topicName, err)
+		}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 
-	resp, err := c.getReadClient().GetMessagesByUser(ctx, &pb.GetMessagesByUserRequest{
-		TopicId:  topicID,
-		UserName: userName,
-		Limit:    limit,
+		resp, err := c.getReadClient().GetMessagesByUser(ctx, &pb.GetMessagesByUserRequest{
+			TopicId:  topicID,
+			UserName: userName,
+			Limit:    limit,
+		})
+		if err != nil {
+			return err
+		}
+
+		fmt.Printf("Messages in topic '%s' (ID: %d) by user '%s':\n", topicName, topicID, userName)
+		for _, msg := range resp.Messages {
+			fmt.Printf("  [%d] User %d: %s (Likes: %d)\n", msg.Id, msg.UserId, msg.Text, msg.Likes)
+		}
+		return nil
 	})
-	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-		return
-	}
-
-	fmt.Printf("Messages in topic '%s' (ID: %d) by user '%s':\n", topicName, topicID, userName)
-	for _, msg := range resp.Messages {
-		fmt.Printf("  [%d] User %d: %s (Likes: %d)\n", msg.Id, msg.UserId, msg.Text, msg.Likes)
-	}
 }
 
 func (c *Client) Subscribe(topicNames []string) {
+	var lastMessageID int64 = 0
+
+	for {
+		err := c.subscribeInternal(topicNames, &lastMessageID)
+		if err == nil {
+			return
+		}
+
+		fmt.Printf("Subscription connection lost: %v. Reconnecting...\n", err)
+		time.Sleep(1 * time.Second)
+
+		if err := c.RefreshTopology(); err != nil {
+			fmt.Printf("Failed to refresh topology: %v. Retrying in 5s...\n", err)
+			time.Sleep(5 * time.Second)
+		}
+	}
+}
+
+func (c *Client) subscribeInternal(topicNames []string, lastMessageID *int64) error {
 	topicIDs := make([]int64, 0)
 	for _, name := range topicNames {
 		tid, err := c.getTopicID(name)
 		if err != nil {
-			fmt.Printf("Warning: Could not find topic '%s', skipping. Error: %v\n", name, err)
-			continue
+			return fmt.Errorf("resolving topic %s: %w", name, err)
 		}
 		topicIDs = append(topicIDs, tid)
 	}
 
 	if len(topicIDs) == 0 {
 		fmt.Println("No valid topics to subscribe to.")
-		return
+		return nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -456,15 +528,13 @@ func (c *Client) Subscribe(topicNames []string) {
 		TopicId: topicIDs,
 	})
 	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-		return
+		return fmt.Errorf("getting subscription node: %w", err)
 	}
 
 	// Connect to subscription node
 	conn, err := grpc.NewClient(subResp.Node.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		fmt.Printf("Error connecting to subscription node: %v\n", err)
-		return
+		return fmt.Errorf("connecting to subscription node: %w", err)
 	}
 	defer conn.Close()
 
@@ -473,12 +543,11 @@ func (c *Client) Subscribe(topicNames []string) {
 	stream, err := client.SubscribeTopic(context.Background(), &pb.SubscribeTopicRequest{
 		UserId:         c.currentUser.Id,
 		TopicId:        topicIDs,
-		FromMessageId:  0,
+		FromMessageId:  *lastMessageID,
 		SubscribeToken: subResp.SubscribeToken,
 	})
 	if err != nil {
-		fmt.Printf("Error subscribing: %v\n", err)
-		return
+		return fmt.Errorf("subscribing: %w", err)
 	}
 
 	fmt.Printf("Subscribed to topics %v (IDs: %v). Waiting for events (Ctrl+C to stop)...\n", topicNames, topicIDs)
@@ -486,8 +555,11 @@ func (c *Client) Subscribe(topicNames []string) {
 	for {
 		event, err := stream.Recv()
 		if err != nil {
-			fmt.Printf("Stream error: %v\n", err)
-			return
+			return fmt.Errorf("stream error: %w", err)
+		}
+
+		if event.Message != nil && event.Message.Id > *lastMessageID {
+			*lastMessageID = event.Message.Id
 		}
 
 		opType := "POST"
@@ -498,14 +570,5 @@ func (c *Client) Subscribe(topicNames []string) {
 		fmt.Printf("[%s] Seq=%d, Msg ID=%d, User=%d, Text=%s, Likes=%d\n",
 			opType, event.SequenceNumber, event.Message.Id, event.Message.UserId,
 			event.Message.Text, event.Message.Likes)
-	}
-}
-
-func (c *Client) Close() {
-	if c.headConn != nil {
-		c.headConn.Close()
-	}
-	for _, conn := range c.readConns {
-		conn.Close()
 	}
 }
