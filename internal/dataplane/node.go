@@ -37,6 +37,7 @@ type Node struct {
 	role        NodeRole
 	nextNode    string // address of next node in chain
 	prevNode    string // address of previous node in chain
+	topologyMu  sync.RWMutex
 	controlAddr string
 
 	// Subscription management
@@ -98,6 +99,8 @@ func NewNode(nodeID, address, dbPath, controlAddr string) (*Node, error) {
 }
 
 func (n *Node) SetRole(role NodeRole, nextNode, prevNode string) {
+	n.topologyMu.Lock()
+	defer n.topologyMu.Unlock()
 	n.role = role
 	n.nextNode = nextNode
 	n.prevNode = prevNode
@@ -645,53 +648,101 @@ func (n *Node) runReplicationWorker() {
 
 func (n *Node) runAckWorker() {
 	for seq := range n.ackQueue {
-		n.acknowledgeWrite(seq)
+		if err := n.acknowledgeWrite(context.Background(), seq); err != nil {
+			log.Printf("Failed to acknowledge write %d: %v", seq, err)
+		}
 	}
 }
 
 func (n *Node) replicateWrite(ctx context.Context, op *pb.WriteOp) error {
-	if n.nextNode == "" {
-		return nil
-	}
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 
-	conn, err := grpc.NewClient(n.nextNode, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		log.Printf("Failed to connect to next node: %v", err)
-		return err
-	}
-	defer conn.Close()
+		n.topologyMu.RLock()
+		next := n.nextNode
+		n.topologyMu.RUnlock()
 
-	client := pb.NewReplicationClient(conn)
-	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
+		if next == "" {
+			return nil
+		}
 
-	_, err = client.ReplicateWrite(reqCtx, &pb.ReplicationRequest{Op: op})
-	if err != nil {
-		log.Printf("Failed to replicate write: %v", err)
-		return err
+		err := func() error {
+			conn, err := grpc.NewClient(next, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				return err
+			}
+			defer conn.Close()
+
+			client := pb.NewReplicationClient(conn)
+			reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+
+			_, err = client.ReplicateWrite(reqCtx, &pb.ReplicationRequest{Op: op})
+			return err
+		}()
+
+		if err == nil {
+			return nil
+		}
+
+		log.Printf("Failed to replicate write (seq %d) to %s: %v. Retrying...", op.Sequence, next, err)
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(1 * time.Second):
+			// retry
+		}
 	}
-	return nil
 }
 
-func (n *Node) acknowledgeWrite(sequence int64) {
-	if n.prevNode == "" {
-		return
-	}
+func (n *Node) acknowledgeWrite(ctx context.Context, sequence int64) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 
-	conn, err := grpc.NewClient(n.prevNode, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		log.Printf("Failed to connect to prev node: %v", err)
-		return
-	}
-	defer conn.Close()
+		n.topologyMu.RLock()
+		prev := n.prevNode
+		n.topologyMu.RUnlock()
 
-	client := pb.NewReplicationClient(conn)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+		if prev == "" {
+			return nil
+		}
 
-	_, err = client.AcknowledgeWrite(ctx, &pb.AcknowledgeRequest{Sequence: sequence})
-	if err != nil {
-		log.Printf("Failed to acknowledge write: %v", err)
+		err := func() error {
+			conn, err := grpc.NewClient(prev, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				return err
+			}
+			defer conn.Close()
+
+			client := pb.NewReplicationClient(conn)
+			reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+
+			_, err = client.AcknowledgeWrite(reqCtx, &pb.AcknowledgeRequest{Sequence: sequence})
+			return err
+		}()
+
+		if err == nil {
+			return nil
+		}
+
+		log.Printf("Failed to acknowledge write (seq %d) to %s: %v. Retrying...", sequence, prev, err)
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(1 * time.Second):
+			// retry
+		}
 	}
 }
 
