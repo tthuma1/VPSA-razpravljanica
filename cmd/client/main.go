@@ -14,6 +14,7 @@ import (
 	"github.com/rivo/tview"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
@@ -299,7 +300,7 @@ func (c *Client) RegisterUser(name, password string) {
 
 		user, err := c.headClient.CreateUser(ctx, &pb.CreateUserRequest{Name: name, Password: password})
 		if err != nil {
-			c.showError(fmt.Sprintf("Error registering: %v", err))
+			c.showError(status.Convert(err).Message())
 			return
 		}
 
@@ -317,7 +318,7 @@ func (c *Client) LoginUser(name, password string) {
 
 		user, err := c.tailClient.Login(ctx, &pb.LoginRequest{Name: name, Password: password})
 		if err != nil {
-			c.showError(fmt.Sprintf("Error logging in: %v", err))
+			c.showError(status.Convert(err).Message())
 			return
 		}
 
@@ -360,7 +361,7 @@ func (c *Client) CreateTopic(name string) {
 
 	_, err := c.headClient.CreateTopic(ctx, &pb.CreateTopicRequest{Name: name})
 	if err != nil {
-		c.showError(fmt.Sprintf("Error creating topic: %v", err))
+		c.showError(status.Convert(err).Message())
 	}
 }
 
@@ -380,7 +381,7 @@ func (c *Client) PostMessage(topicName string, text string) {
 		topicID, err := c.getTopicID(topicName)
 		if err != nil {
 			c.app.QueueUpdateDraw(func() {
-				c.statusLine.SetText(fmt.Sprintf("Error finding topic: %v", err))
+				c.statusLine.SetText(status.Convert(err).Message())
 			})
 			return
 		}
@@ -395,7 +396,7 @@ func (c *Client) PostMessage(topicName string, text string) {
 		})
 		if err != nil {
 			c.app.QueueUpdateDraw(func() {
-				c.statusLine.SetText(fmt.Sprintf("Error posting: %v", err))
+				c.statusLine.SetText(status.Convert(err).Message())
 			})
 		}
 	}()
@@ -423,7 +424,7 @@ func (c *Client) Subscribe(ctx context.Context, topicNames []string) {
 	cancel()
 	if err != nil {
 		c.app.QueueUpdateDraw(func() {
-			c.statusLine.SetText(fmt.Sprintf("Error getting sub node: %v", err))
+			c.statusLine.SetText(status.Convert(err).Message())
 		})
 		return
 	}
