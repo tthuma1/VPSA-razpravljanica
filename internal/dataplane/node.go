@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"log"
 	"sync"
 	"time"
@@ -35,6 +36,8 @@ type Node struct {
 	storage     *Storage
 	role        NodeRole
 	nextNode    string // address of next node in chain
+	prevNode    string // address of previous node in chain
+	topologyMu  sync.RWMutex
 	controlAddr string
 
 	// Subscription management
@@ -45,6 +48,23 @@ type Node struct {
 	// Event broadcast
 	eventListeners []chan *pb.MessageEvent
 	eventMu        sync.RWMutex
+
+	// Pending writes (Head only) and Unacknowledged writes (All nodes except Tail)
+	// Map sequence number to:
+	// - Head: channel for waiting client
+	// - Middle: nil (just tracking existence for read consistency)
+	pendingWrites map[int64]chan error
+	pendingMu     sync.RWMutex
+
+	// Syncing state
+	syncing bool
+	syncMu  sync.RWMutex
+
+	// Replication queue ensures writes are forwarded in order
+	replQueue chan *pb.WriteOp
+
+	// Ack queue ensures acknowledgements are forwarded in order
+	ackQueue chan int64
 }
 
 type Subscription struct {
@@ -66,19 +86,44 @@ func NewNode(nodeID, address, dbPath, controlAddr string) (*Node, error) {
 		storage:       storage,
 		subscriptions: make(map[string]*Subscription),
 		controlAddr:   controlAddr,
+		pendingWrites: make(map[int64]chan error),
+		syncing:       false,
+		replQueue:     make(chan *pb.WriteOp, 1000),
+		ackQueue:      make(chan int64, 1000),
 	}
+
+	go node.runReplicationWorker()
+	go node.runAckWorker()
 
 	return node, nil
 }
 
-func (n *Node) SetRole(role NodeRole, nextNode string) {
+func (n *Node) SetRole(role NodeRole, nextNode, prevNode string) {
+	n.topologyMu.Lock()
+	defer n.topologyMu.Unlock()
+	if n.role == role && n.nextNode == nextNode && n.prevNode == prevNode {
+		return
+	}
 	n.role = role
 	n.nextNode = nextNode
-	log.Printf("Node %s role set to %v, next node: %s", n.nodeID, role, nextNode)
+	n.prevNode = prevNode
+	log.Printf("Node %s role set to %v, next node: %s, prev node: %s", n.nodeID, role, nextNode, prevNode)
+}
+
+func (n *Node) checkSyncing() error {
+	n.syncMu.RLock()
+	defer n.syncMu.RUnlock()
+	if n.syncing {
+		return fmt.Errorf("node is syncing")
+	}
+	return nil
 }
 
 // Write operations (Head only)
 func (n *Node) CreateUser(ctx context.Context, req *pb.CreateUserRequest) (*pb.User, error) {
+	if err := n.checkSyncing(); err != nil {
+		return nil, err
+	}
 	if n.role != RoleHead {
 		return nil, fmt.Errorf("not the head node")
 	}
@@ -93,20 +138,54 @@ func (n *Node) CreateUser(ctx context.Context, req *pb.CreateUserRequest) (*pb.U
 		// Update request with generated salt if it was empty
 		req.Salt = user.Salt
 
-		go n.replicateWrite(&pb.WriteOp{
+		seq, err := n.storage.LogOperation(&pb.WriteOp{
 			Operation: &pb.WriteOp_CreateUser{CreateUser: req},
-			Sequence:  n.storage.NextSequence(),
 		})
+		if err != nil {
+			return nil, err
+		}
+
+		errChan := make(chan error, 1)
+		n.pendingMu.Lock()
+		n.pendingWrites[seq] = errChan
+		n.pendingMu.Unlock()
+
+		err = n.replicateWrite(ctx, &pb.WriteOp{
+			Operation: &pb.WriteOp_CreateUser{CreateUser: req},
+			Sequence:  seq,
+		})
+		if err != nil {
+			n.pendingMu.Lock()
+			delete(n.pendingWrites, seq)
+			n.pendingMu.Unlock()
+			return nil, err
+		}
+
+		// Wait for acknowledgement
+		select {
+		case err := <-errChan:
+			if err != nil {
+				return nil, err
+			}
+		case <-ctx.Done():
+			n.pendingMu.Lock()
+			delete(n.pendingWrites, seq)
+			n.pendingMu.Unlock()
+			return nil, ctx.Err()
+		}
 	}
 
 	return user, nil
 }
 
 func (n *Node) Login(ctx context.Context, req *pb.LoginRequest) (*pb.User, error) {
+	if err := n.checkSyncing(); err != nil {
+		return nil, err
+	}
 	// Login is a read operation but involves password verification.
-	// In chain replication, reads go to Tail.
-	if n.role != RoleTail {
-		return nil, fmt.Errorf("not the tail node")
+	// Check if we have unacknowledged writes. If so, forward to tail.
+	if n.role != RoleTail && n.hasPendingWrites() {
+		return n.forwardLoginToTail(ctx, req)
 	}
 
 	user, err := n.storage.VerifyUser(req.Name, req.Password)
@@ -118,12 +197,12 @@ func (n *Node) Login(ctx context.Context, req *pb.LoginRequest) (*pb.User, error
 }
 
 func (n *Node) GetUser(ctx context.Context, req *pb.GetUserRequest) (*pb.User, error) {
-	// Reads can be served by Tail (strong consistency) or Head (read-your-writes, though not strictly guaranteed here without more logic).
-	// For simplicity and consistency with other reads, let's enforce Tail.
-	// However, for login, we might want to check Head if we just created the user.
-	// But standard chain replication says reads go to Tail.
-	if n.role != RoleTail {
-		return nil, fmt.Errorf("not the tail node")
+	if err := n.checkSyncing(); err != nil {
+		return nil, err
+	}
+	// Check if we have unacknowledged writes. If so, forward to tail.
+	if n.role != RoleTail && n.hasPendingWrites() {
+		return n.forwardGetUserToTail(ctx, req)
 	}
 
 	user, err := n.storage.GetUserByName(req.Name)
@@ -154,6 +233,9 @@ func (n *Node) GetUserById(ctx context.Context, req *pb.GetUserByIdRequest) (*pb
 }
 
 func (n *Node) CreateTopic(ctx context.Context, req *pb.CreateTopicRequest) (*pb.Topic, error) {
+	if err := n.checkSyncing(); err != nil {
+		return nil, err
+	}
 	if n.role != RoleHead {
 		return nil, fmt.Errorf("not the head node")
 	}
@@ -164,19 +246,53 @@ func (n *Node) CreateTopic(ctx context.Context, req *pb.CreateTopicRequest) (*pb
 	}
 
 	if n.nextNode != "" {
-		go n.replicateWrite(&pb.WriteOp{
+		seq, err := n.storage.LogOperation(&pb.WriteOp{
 			Operation: &pb.WriteOp_CreateTopic{CreateTopic: req},
-			Sequence:  n.storage.NextSequence(),
 		})
+		if err != nil {
+			return nil, err
+		}
+
+		errChan := make(chan error, 1)
+		n.pendingMu.Lock()
+		n.pendingWrites[seq] = errChan
+		n.pendingMu.Unlock()
+
+		err = n.replicateWrite(ctx, &pb.WriteOp{
+			Operation: &pb.WriteOp_CreateTopic{CreateTopic: req},
+			Sequence:  seq,
+		})
+		if err != nil {
+			n.pendingMu.Lock()
+			delete(n.pendingWrites, seq)
+			n.pendingMu.Unlock()
+			return nil, err
+		}
+
+		// Wait for acknowledgement
+		select {
+		case err := <-errChan:
+			if err != nil {
+				return nil, err
+			}
+		case <-ctx.Done():
+			n.pendingMu.Lock()
+			delete(n.pendingWrites, seq)
+			n.pendingMu.Unlock()
+			return nil, ctx.Err()
+		}
 	}
 
 	return topic, nil
 }
 
 func (n *Node) GetTopic(ctx context.Context, req *pb.GetTopicRequest) (*pb.Topic, error) {
-	// Reads go to Tail
-	if n.role != RoleTail {
-		return nil, fmt.Errorf("not the tail node")
+	if err := n.checkSyncing(); err != nil {
+		return nil, err
+	}
+	// Check if we have unacknowledged writes. If so, forward to tail.
+	if n.role != RoleTail && n.hasPendingWrites() {
+		return n.forwardGetTopicToTail(ctx, req)
 	}
 
 	topic, err := n.storage.GetTopicByName(req.Name)
@@ -191,6 +307,9 @@ func (n *Node) GetTopic(ctx context.Context, req *pb.GetTopicRequest) (*pb.Topic
 }
 
 func (n *Node) PostMessage(ctx context.Context, req *pb.PostMessageRequest) (*pb.Message, error) {
+	if err := n.checkSyncing(); err != nil {
+		return nil, err
+	}
 	if n.role != RoleHead {
 		return nil, fmt.Errorf("not the head node")
 	}
@@ -200,7 +319,13 @@ func (n *Node) PostMessage(ctx context.Context, req *pb.PostMessageRequest) (*pb
 		return nil, err
 	}
 
-	seq := n.storage.NextSequence()
+	seq, err := n.storage.LogOperation(&pb.WriteOp{
+		Operation: &pb.WriteOp_PostMessage{PostMessage: req},
+	})
+	if err != nil {
+		return nil, err
+	}
+
 	event := &pb.MessageEvent{
 		SequenceNumber: seq,
 		Op:             pb.OpType_OP_POST,
@@ -212,17 +337,45 @@ func (n *Node) PostMessage(ctx context.Context, req *pb.PostMessageRequest) (*pb
 	n.broadcastEvent(event)
 
 	if n.nextNode != "" {
-		go n.replicateWrite(&pb.WriteOp{
+		go n.notifyEvent(event)
+
+		errChan := make(chan error, 1)
+		n.pendingMu.Lock()
+		n.pendingWrites[seq] = errChan
+		n.pendingMu.Unlock()
+
+		err := n.replicateWrite(ctx, &pb.WriteOp{
 			Operation: &pb.WriteOp_PostMessage{PostMessage: req},
 			Sequence:  seq,
 		})
-		go n.notifyEvent(event)
+		if err != nil {
+			n.pendingMu.Lock()
+			delete(n.pendingWrites, seq)
+			n.pendingMu.Unlock()
+			return nil, err
+		}
+
+		// Wait for acknowledgement
+		select {
+		case err := <-errChan:
+			if err != nil {
+				return nil, err
+			}
+		case <-ctx.Done():
+			n.pendingMu.Lock()
+			delete(n.pendingWrites, seq)
+			n.pendingMu.Unlock()
+			return nil, ctx.Err()
+		}
 	}
 
 	return msg, nil
 }
 
 func (n *Node) LikeMessage(ctx context.Context, req *pb.LikeMessageRequest) (*pb.Message, error) {
+	if err := n.checkSyncing(); err != nil {
+		return nil, err
+	}
 	if n.role != RoleHead {
 		return nil, fmt.Errorf("not the head node")
 	}
@@ -232,7 +385,13 @@ func (n *Node) LikeMessage(ctx context.Context, req *pb.LikeMessageRequest) (*pb
 		return nil, err
 	}
 
-	seq := n.storage.NextSequence()
+	seq, err := n.storage.LogOperation(&pb.WriteOp{
+		Operation: &pb.WriteOp_LikeMessage{LikeMessage: req},
+	})
+	if err != nil {
+		return nil, err
+	}
+
 	event := &pb.MessageEvent{
 		SequenceNumber: seq,
 		Op:             pb.OpType_OP_LIKE,
@@ -243,20 +402,49 @@ func (n *Node) LikeMessage(ctx context.Context, req *pb.LikeMessageRequest) (*pb
 	n.broadcastEvent(event)
 
 	if n.nextNode != "" {
-		go n.replicateWrite(&pb.WriteOp{
+		go n.notifyEvent(event)
+
+		errChan := make(chan error, 1)
+		n.pendingMu.Lock()
+		n.pendingWrites[seq] = errChan
+		n.pendingMu.Unlock()
+
+		err := n.replicateWrite(ctx, &pb.WriteOp{
 			Operation: &pb.WriteOp_LikeMessage{LikeMessage: req},
 			Sequence:  seq,
 		})
-		go n.notifyEvent(event)
+		if err != nil {
+			n.pendingMu.Lock()
+			delete(n.pendingWrites, seq)
+			n.pendingMu.Unlock()
+			return nil, err
+		}
+
+		// Wait for acknowledgement
+		select {
+		case err := <-errChan:
+			if err != nil {
+				return nil, err
+			}
+		case <-ctx.Done():
+			n.pendingMu.Lock()
+			delete(n.pendingWrites, seq)
+			n.pendingMu.Unlock()
+			return nil, ctx.Err()
+		}
 	}
 
 	return msg, nil
 }
 
-// Read operations (Tail only)
+// Read operations
 func (n *Node) ListTopics(ctx context.Context, _ *emptypb.Empty) (*pb.ListTopicsResponse, error) {
-	if n.role != RoleTail {
-		return nil, fmt.Errorf("not the tail node")
+	if err := n.checkSyncing(); err != nil {
+		return nil, err
+	}
+	// Check if we have unacknowledged writes. If so, forward to tail.
+	if n.role != RoleTail && n.hasPendingWrites() {
+		return n.forwardListTopicsToTail(ctx)
 	}
 
 	topics, err := n.storage.ListTopics()
@@ -268,8 +456,12 @@ func (n *Node) ListTopics(ctx context.Context, _ *emptypb.Empty) (*pb.ListTopics
 }
 
 func (n *Node) GetMessages(ctx context.Context, req *pb.GetMessagesRequest) (*pb.GetMessagesResponse, error) {
-	if n.role != RoleTail {
-		return nil, fmt.Errorf("not the tail node")
+	if err := n.checkSyncing(); err != nil {
+		return nil, err
+	}
+	// Check if we have unacknowledged writes. If so, forward to tail.
+	if n.role != RoleTail && n.hasPendingWrites() {
+		return n.forwardGetMessagesToTail(ctx, req)
 	}
 
 	messages, err := n.storage.GetMessages(req.TopicId, req.FromMessageId, req.Limit)
@@ -281,8 +473,12 @@ func (n *Node) GetMessages(ctx context.Context, req *pb.GetMessagesRequest) (*pb
 }
 
 func (n *Node) GetMessagesByUser(ctx context.Context, req *pb.GetMessagesByUserRequest) (*pb.GetMessagesResponse, error) {
-	if n.role != RoleTail {
-		return nil, fmt.Errorf("not the tail node")
+	if err := n.checkSyncing(); err != nil {
+		return nil, err
+	}
+	// Check if we have unacknowledged writes. If so, forward to tail.
+	if n.role != RoleTail && n.hasPendingWrites() {
+		return n.forwardGetMessagesByUserToTail(ctx, req)
 	}
 
 	messages, err := n.storage.GetMessagesByUser(req.TopicId, req.UserName, req.Limit)
@@ -295,6 +491,9 @@ func (n *Node) GetMessagesByUser(ctx context.Context, req *pb.GetMessagesByUserR
 
 // Subscription handling
 func (n *Node) GetSubscriptionNode(ctx context.Context, req *pb.SubscriptionNodeRequest) (*pb.SubscriptionNodeResponse, error) {
+	if err := n.checkSyncing(); err != nil {
+		return nil, err
+	}
 	if n.role != RoleHead {
 		return nil, fmt.Errorf("not the head node")
 	}
@@ -312,6 +511,9 @@ func (n *Node) GetSubscriptionNode(ctx context.Context, req *pb.SubscriptionNode
 }
 
 func (n *Node) SubscribeTopic(req *pb.SubscribeTopicRequest, stream pb.MessageBoard_SubscribeTopicServer) error {
+	if err := n.checkSyncing(); err != nil {
+		return err
+	}
 	sub := &Subscription{
 		UserID:        req.UserId,
 		TopicIDs:      req.TopicId,
@@ -365,35 +567,70 @@ func (n *Node) SubscribeTopic(req *pb.SubscribeTopicRequest, stream pb.MessageBo
 func (n *Node) ReplicateWrite(ctx context.Context, req *pb.ReplicationRequest) (*emptypb.Empty, error) {
 	op := req.Op
 
-	switch o := op.Operation.(type) {
-	case *pb.WriteOp_CreateUser:
-		_, err := n.storage.CreateUser(o.CreateUser.Name, o.CreateUser.Password, o.CreateUser.Salt)
-		if err != nil {
-			return nil, err
+	// Mark as unacknowledged before processing
+	if n.role != RoleTail {
+		n.pendingMu.Lock()
+		if _, exists := n.pendingWrites[op.Sequence]; !exists {
+			n.pendingWrites[op.Sequence] = nil
 		}
-	case *pb.WriteOp_CreateTopic:
-		_, err := n.storage.CreateTopic(o.CreateTopic.Name)
-		if err != nil {
-			return nil, err
-		}
-	case *pb.WriteOp_PostMessage:
-		_, err := n.storage.PostMessage(o.PostMessage.TopicId, o.PostMessage.UserId, o.PostMessage.Text)
-		if err != nil {
-			return nil, err
-		}
-	case *pb.WriteOp_LikeMessage:
-		_, err := n.storage.LikeMessage(o.LikeMessage.TopicId, o.LikeMessage.MessageId, o.LikeMessage.UserId)
-		if err != nil {
-			return nil, err
-		}
+		n.pendingMu.Unlock()
+	}
+
+	if err := n.applyWriteOp(op); err != nil {
+		return nil, err
 	}
 
 	// Forward to next node
 	if n.nextNode != "" && n.role != RoleTail {
-		go n.replicateWrite(op)
+		n.replQueue <- op
+	} else if n.role == RoleTail {
+		// If we are the tail, we acknowledge the write to the previous node
+		n.ackQueue <- op.Sequence
+		// Also update our own last acked sequence
+		if err := n.storage.UpdateLastAcked(op.Sequence); err != nil {
+			log.Printf("Failed to update last acked: %v", err)
+		}
 	}
 
 	return &emptypb.Empty{}, nil
+}
+
+func (n *Node) applyWriteOp(op *pb.WriteOp) error {
+	// Log the operation first (idempotent)
+	if _, err := n.storage.LogOperation(op); err != nil {
+		return err
+	}
+
+	switch o := op.Operation.(type) {
+	case *pb.WriteOp_CreateUser:
+		_, err := n.storage.CreateUser(o.CreateUser.Name, o.CreateUser.Password, o.CreateUser.Salt)
+		if err != nil {
+			// If user already exists, it might be due to replay. Check if it exists.
+			if _, errGet := n.storage.GetUserByName(o.CreateUser.Name); errGet == nil {
+				return nil
+			}
+			return err
+		}
+	case *pb.WriteOp_CreateTopic:
+		_, err := n.storage.CreateTopic(o.CreateTopic.Name)
+		if err != nil {
+			if _, errGet := n.storage.GetTopicByName(o.CreateTopic.Name); errGet == nil {
+				return nil
+			}
+			return err
+		}
+	case *pb.WriteOp_PostMessage:
+		_, err := n.storage.PostMessage(o.PostMessage.TopicId, o.PostMessage.UserId, o.PostMessage.Text)
+		if err != nil {
+			return err
+		}
+	case *pb.WriteOp_LikeMessage:
+		_, err := n.storage.LikeMessage(o.LikeMessage.TopicId, o.LikeMessage.MessageId, o.LikeMessage.UserId)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (n *Node) NotifyEvent(ctx context.Context, event *pb.MessageEvent) (*emptypb.Empty, error) {
@@ -406,25 +643,142 @@ func (n *Node) NotifyEvent(ctx context.Context, event *pb.MessageEvent) (*emptyp
 	return &emptypb.Empty{}, nil
 }
 
-func (n *Node) replicateWrite(op *pb.WriteOp) {
-	if n.nextNode == "" {
-		return
+func (n *Node) AcknowledgeWrite(ctx context.Context, req *pb.AcknowledgeRequest) (*emptypb.Empty, error) {
+	// Persist acknowledgement
+	if err := n.storage.UpdateLastAcked(req.Sequence); err != nil {
+		log.Printf("Failed to persist acknowledgement for seq %d: %v", req.Sequence, err)
 	}
 
-	conn, err := grpc.NewClient(n.nextNode, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		log.Printf("Failed to connect to next node: %v", err)
-		return
+	n.pendingMu.Lock()
+	ch, exists := n.pendingWrites[req.Sequence]
+	delete(n.pendingWrites, req.Sequence)
+	n.pendingMu.Unlock()
+
+	if n.role == RoleHead {
+		if exists && ch != nil {
+			ch <- nil
+		}
+	} else {
+		// Propagate acknowledgement to previous node
+		n.ackQueue <- req.Sequence
 	}
-	defer conn.Close()
+	return &emptypb.Empty{}, nil
+}
 
-	client := pb.NewReplicationClient(conn)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	_, err = client.ReplicateWrite(ctx, &pb.ReplicationRequest{Op: op})
+func (n *Node) GetLastAcked(ctx context.Context, _ *emptypb.Empty) (*pb.GetLastAckedResponse, error) {
+	seq, err := n.storage.GetLastAcked()
 	if err != nil {
-		log.Printf("Failed to replicate write: %v", err)
+		return nil, err
+	}
+	return &pb.GetLastAckedResponse{Sequence: seq}, nil
+}
+
+func (n *Node) runReplicationWorker() {
+	for op := range n.replQueue {
+		// Forward writes sequentially to preserve order
+		if err := n.replicateWrite(context.Background(), op); err != nil {
+			log.Printf("Failed to replicate write (seq %d): %v", op.Sequence, err)
+		}
+	}
+}
+
+func (n *Node) runAckWorker() {
+	for seq := range n.ackQueue {
+		if err := n.acknowledgeWrite(context.Background(), seq); err != nil {
+			log.Printf("Failed to acknowledge write %d: %v", seq, err)
+		}
+	}
+}
+
+func (n *Node) replicateWrite(ctx context.Context, op *pb.WriteOp) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		n.topologyMu.RLock()
+		next := n.nextNode
+		n.topologyMu.RUnlock()
+
+		if next == "" {
+			return nil
+		}
+
+		err := func() error {
+			conn, err := grpc.NewClient(next, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				return err
+			}
+			defer conn.Close()
+
+			client := pb.NewReplicationClient(conn)
+			reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+
+			_, err = client.ReplicateWrite(reqCtx, &pb.ReplicationRequest{Op: op})
+			return err
+		}()
+
+		if err == nil {
+			return nil
+		}
+
+		log.Printf("Failed to replicate write (seq %d) to %s: %v. Retrying...", op.Sequence, next, err)
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(1 * time.Second):
+			// retry
+		}
+	}
+}
+
+func (n *Node) acknowledgeWrite(ctx context.Context, sequence int64) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		n.topologyMu.RLock()
+		prev := n.prevNode
+		n.topologyMu.RUnlock()
+
+		if prev == "" {
+			return nil
+		}
+
+		err := func() error {
+			conn, err := grpc.NewClient(prev, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				return err
+			}
+			defer conn.Close()
+
+			client := pb.NewReplicationClient(conn)
+			reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+
+			_, err = client.AcknowledgeWrite(reqCtx, &pb.AcknowledgeRequest{Sequence: sequence})
+			return err
+		}()
+
+		if err == nil {
+			return nil
+		}
+
+		log.Printf("Failed to acknowledge write (seq %d) to %s: %v. Retrying...", sequence, prev, err)
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(1 * time.Second):
+			// retry
+		}
 	}
 }
 
@@ -469,10 +823,100 @@ func generateToken() string {
 	return hex.EncodeToString(b)
 }
 
-func (n *Node) SyncState(ctx context.Context, _ *emptypb.Empty) (*pb.StateSnapshot, error) {
-	return &pb.StateSnapshot{
-		LastSequence: n.storage.GetLastSequence(),
-	}, nil
+func (n *Node) StreamLog(req *pb.StreamLogRequest, stream pb.Replication_StreamLogServer) error {
+	ops, err := n.storage.GetOperations(req.FromSequence)
+	if err != nil {
+		return err
+	}
+	for _, op := range ops {
+		if err := stream.Send(op); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (n *Node) SyncWithTail(ctx context.Context) error {
+	n.syncMu.Lock()
+	n.syncing = true
+	n.syncMu.Unlock()
+
+	defer func() {
+		n.syncMu.Lock()
+		n.syncing = false
+		n.syncMu.Unlock()
+	}()
+
+	// Get tail node from control plane
+	cpConn, err := grpc.NewClient(n.controlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return fmt.Errorf("failed to connect to control plane: %v", err)
+	}
+	defer cpConn.Close()
+	cpClient := pb.NewControlPlaneClient(cpConn)
+
+	state, err := cpClient.GetClusterState(ctx, &emptypb.Empty{})
+	if err != nil {
+		return fmt.Errorf("failed to get cluster state: %v", err)
+	}
+
+	if state.Tail == nil {
+		log.Printf("No tail node found, skipping sync")
+		_, err = cpClient.ConfirmSynced(ctx, &pb.ConfirmSyncedRequest{NodeId: n.nodeID})
+		return err
+	}
+
+	tailAddr := state.Tail.Address
+	log.Printf("Starting sync with tail node %s", tailAddr)
+
+	conn, err := grpc.NewClient(tailAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	client := pb.NewReplicationClient(conn)
+
+	// Get local last sequence
+	lastSeq := n.storage.GetLastSequence()
+	log.Printf("Local last sequence: %d", lastSeq)
+
+	// Stream Log
+	stream, err := client.StreamLog(ctx, &pb.StreamLogRequest{FromSequence: lastSeq + 1})
+	if err != nil {
+		return fmt.Errorf("failed to start log stream: %v", err)
+	}
+
+	log.Printf("Streaming log from sequence %d", lastSeq+1)
+
+	for {
+		op, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("stream error: %v", err)
+		}
+		// Apply op
+		log.Printf("Applying %d, %s", op.Sequence, op.Operation)
+		if err := n.applyWriteOp(op); err != nil {
+			return fmt.Errorf("failed to apply op %d: %v", op.Sequence, err)
+		}
+
+		// Update last acked sequence since we received it from tail
+		if err := n.storage.UpdateLastAcked(op.Sequence); err != nil {
+			log.Printf("Failed to update last acked during sync: %v", err)
+		}
+	}
+
+	log.Printf("Sync completed")
+
+	// Confirm Synced
+	_, err = cpClient.ConfirmSynced(ctx, &pb.ConfirmSyncedRequest{NodeId: n.nodeID})
+	if err != nil {
+		return fmt.Errorf("failed to confirm synced: %v", err)
+	}
+
+	return nil
 }
 
 func (n *Node) Close() {
@@ -481,4 +925,95 @@ func (n *Node) Close() {
 
 func (n *Node) NodeID() string {
 	return n.nodeID
+}
+
+func (n *Node) hasPendingWrites() bool {
+	n.pendingMu.RLock()
+	defer n.pendingMu.RUnlock()
+	return len(n.pendingWrites) > 0
+}
+
+// Forwarding methods
+func (n *Node) forwardLoginToTail(ctx context.Context, req *pb.LoginRequest) (*pb.User, error) {
+	client, conn, err := n.getTailClient()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	return client.Login(ctx, req)
+}
+
+func (n *Node) forwardGetUserToTail(ctx context.Context, req *pb.GetUserRequest) (*pb.User, error) {
+	client, conn, err := n.getTailClient()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	return client.GetUser(ctx, req)
+}
+
+func (n *Node) forwardGetTopicToTail(ctx context.Context, req *pb.GetTopicRequest) (*pb.Topic, error) {
+	client, conn, err := n.getTailClient()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	return client.GetTopic(ctx, req)
+}
+
+func (n *Node) forwardListTopicsToTail(ctx context.Context) (*pb.ListTopicsResponse, error) {
+	client, conn, err := n.getTailClient()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	return client.ListTopics(ctx, &emptypb.Empty{})
+}
+
+func (n *Node) forwardGetMessagesToTail(ctx context.Context, req *pb.GetMessagesRequest) (*pb.GetMessagesResponse, error) {
+	client, conn, err := n.getTailClient()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	return client.GetMessages(ctx, req)
+}
+
+func (n *Node) forwardGetMessagesByUserToTail(ctx context.Context, req *pb.GetMessagesByUserRequest) (*pb.GetMessagesResponse, error) {
+	client, conn, err := n.getTailClient()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	return client.GetMessagesByUser(ctx, req)
+}
+
+func (n *Node) getTailClient() (pb.MessageBoardClient, *grpc.ClientConn, error) {
+	// We need to find the tail node. We can ask the control plane.
+	conn, err := grpc.NewClient(n.controlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to connect to control plane: %v", err)
+	}
+	// Don't close control plane conn here, we need it for the request
+
+	cpClient := pb.NewControlPlaneClient(conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	state, err := cpClient.GetClusterState(ctx, &emptypb.Empty{})
+	cancel()
+	conn.Close() // Close control plane connection
+
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get cluster state: %v", err)
+	}
+
+	if state.Tail == nil {
+		return nil, nil, fmt.Errorf("tail node not found")
+	}
+
+	tailConn, err := grpc.NewClient(state.Tail.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to connect to tail node: %v", err)
+	}
+
+	return pb.NewMessageBoardClient(tailConn), tailConn, nil
 }

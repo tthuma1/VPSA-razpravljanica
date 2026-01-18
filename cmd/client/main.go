@@ -13,6 +13,7 @@ import (
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -23,10 +24,15 @@ var (
 )
 
 type Client struct {
-	headConn    *grpc.ClientConn
-	tailConn    *grpc.ClientConn
-	headClient  pb.MessageBoardClient
-	tailClient  pb.MessageBoardClient
+	controlAddr string
+
+	headConn   *grpc.ClientConn
+	headClient pb.MessageBoardClient
+
+	readConns   []*grpc.ClientConn
+	readClients []pb.MessageBoardClient
+	readIndex   int
+
 	currentUser *pb.User
 
 	app          *tview.Application
@@ -219,7 +225,7 @@ func (c *Client) refreshTopics() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	resp, err := c.tailClient.ListTopics(ctx, &emptypb.Empty{})
+	resp, err := c.getReadClient().ListTopics(ctx, &emptypb.Empty{})
 	if err != nil {
 		c.statusLine.SetText(fmt.Sprintf("Error listing topics: %v", err))
 		return
@@ -264,7 +270,12 @@ func (c *Client) postMessage(text string) {
 // grcp client
 
 func (c *Client) Connect(controlAddr string) error {
-	conn, err := grpc.NewClient(controlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	c.controlAddr = controlAddr
+	return c.RefreshTopology()
+}
+
+func (c *Client) RefreshTopology() error {
+	conn, err := grpc.NewClient(c.controlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return fmt.Errorf("failed to connect to control plane: %w", err)
 	}
@@ -273,58 +284,114 @@ func (c *Client) Connect(controlAddr string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	state, err := client.GetClusterState(ctx, &emptypb.Empty{})
+	state, err := client.GetChainState(ctx, &emptypb.Empty{})
 	if err != nil {
-		return fmt.Errorf("failed to get cluster state: %w", err)
+		return fmt.Errorf("failed to get chain state: %w", err)
 	}
 
-	c.headConn, err = grpc.NewClient(state.Head.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if len(state.Chain) == 0 {
+		return fmt.Errorf("chain is empty")
+	}
+
+	// Close existing connections
+	c.Close()
+
+	// Connect to head
+	c.headConn, err = grpc.NewClient(state.Chain[0].Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return fmt.Errorf("failed to connect to head: %w", err)
 	}
 	c.headClient = pb.NewMessageBoardClient(c.headConn)
 
-	c.tailConn, err = grpc.NewClient(state.Tail.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return fmt.Errorf("failed to connect to tail: %w", err)
-	}
-	c.tailClient = pb.NewMessageBoardClient(c.tailConn)
+	// Connect to all nodes for reading
+	c.readConns = make([]*grpc.ClientConn, 0, len(state.Chain))
+	c.readClients = make([]pb.MessageBoardClient, 0, len(state.Chain))
 
+	for _, node := range state.Chain {
+		conn, err := grpc.NewClient(node.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			fmt.Printf("Warning: failed to connect to node %s: %v\n", node.Address, err)
+			continue
+		}
+		c.readConns = append(c.readConns, conn)
+		c.readClients = append(c.readClients, pb.NewMessageBoardClient(conn))
+	}
+
+	if len(c.readClients) == 0 {
+		return fmt.Errorf("failed to connect to any nodes")
+	}
+
+	c.readIndex = 0
+	fmt.Printf("Topology refreshed. Head: %s, Read nodes: %d\n", state.Chain[0].Address, len(c.readClients))
 	return nil
+}
+
+func (c *Client) getReadClient() pb.MessageBoardClient {
+	if len(c.readClients) == 0 {
+		return c.headClient
+	}
+	client := c.readClients[c.readIndex]
+	c.readIndex = (c.readIndex + 1) % len(c.readClients)
+	return client
+}
+
+func (c *Client) withRetry(op func() error) {
+	err := op()
+	if err == nil {
+		return
+	}
+
+	// fmt.Printf("Operation failed: %v. Refreshing topology...\n", err)
+	if refreshErr := c.RefreshTopology(); refreshErr != nil {
+		// fmt.Printf("Failed to refresh topology: %v\n", refreshErr)
+		c.showError(status.Convert(err).Message())
+		return
+	}
+
+	if err := op(); err != nil {
+		// fmt.Printf("Operation failed after retry: %v\n", err)
+		c.showError(status.Convert(err).Message())
+	}
 }
 
 func (c *Client) RegisterUser(name, password string) {
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
+		c.withRetry(func() error {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
 
-		user, err := c.headClient.CreateUser(ctx, &pb.CreateUserRequest{Name: name, Password: password})
-		if err != nil {
-			c.showError(status.Convert(err).Message())
-			return
-		}
+			user, err := c.headClient.CreateUser(ctx, &pb.CreateUserRequest{Name: name, Password: password})
+			if err != nil {
+				c.showError(status.Convert(err).Message())
+				return err
+			}
 
-		c.app.QueueUpdateDraw(func() {
-			c.currentUser = user
-			c.showMainUI()
+			c.app.QueueUpdateDraw(func() {
+				c.currentUser = user
+				c.showMainUI()
+			})
+			return nil
 		})
 	}()
 }
 
 func (c *Client) LoginUser(name, password string) {
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
+		c.withRetry(func() error {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
 
-		user, err := c.tailClient.Login(ctx, &pb.LoginRequest{Name: name, Password: password})
-		if err != nil {
-			c.showError(status.Convert(err).Message())
-			return
-		}
+			user, err := c.getReadClient().Login(ctx, &pb.LoginRequest{Name: name, Password: password})
+			if err != nil {
+				c.showError(status.Convert(err).Message())
+				return err
+			}
 
-		c.app.QueueUpdateDraw(func() {
-			c.currentUser = user
-			c.showMainUI()
+			c.app.QueueUpdateDraw(func() {
+				c.currentUser = user
+				c.showMainUI()
+			})
+			return nil
 		})
 	}()
 }
@@ -356,20 +423,23 @@ func (c *Client) Logout() {
 }
 
 func (c *Client) CreateTopic(name string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	c.withRetry(func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 
-	_, err := c.headClient.CreateTopic(ctx, &pb.CreateTopicRequest{Name: name})
-	if err != nil {
-		c.showError(status.Convert(err).Message())
-	}
+		_, err := c.headClient.CreateTopic(ctx, &pb.CreateTopicRequest{Name: name})
+		if err != nil {
+			c.showError(status.Convert(err).Message())
+		}
+		return nil
+	})
 }
 
 func (c *Client) getTopicID(name string) (int64, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	topic, err := c.tailClient.GetTopic(ctx, &pb.GetTopicRequest{Name: name})
+	topic, err := c.getReadClient().GetTopic(ctx, &pb.GetTopicRequest{Name: name})
 	if err != nil {
 		return 0, err
 	}
@@ -378,42 +448,168 @@ func (c *Client) getTopicID(name string) (int64, error) {
 
 func (c *Client) PostMessage(topicName string, text string) {
 	go func() {
-		topicID, err := c.getTopicID(topicName)
-		if err != nil {
-			c.app.QueueUpdateDraw(func() {
-				c.statusLine.SetText(status.Convert(err).Message())
+		c.withRetry(func() error {
+			topicID, err := c.getTopicID(topicName)
+			if err != nil {
+				c.app.QueueUpdateDraw(func() {
+					c.statusLine.SetText(status.Convert(err).Message())
+				})
+				return err
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			_, err = c.headClient.PostMessage(ctx, &pb.PostMessageRequest{
+				TopicId: topicID,
+				UserId:  c.currentUser.Id,
+				Text:    text,
 			})
-			return
-		}
+			if err != nil {
+				c.app.QueueUpdateDraw(func() {
+					c.statusLine.SetText(status.Convert(err).Message())
+				})
+				return err
+			}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		_, err = c.headClient.PostMessage(ctx, &pb.PostMessageRequest{
-			TopicId: topicID,
-			UserId:  c.currentUser.Id,
-			Text:    text,
+			return nil
 		})
-		if err != nil {
-			c.app.QueueUpdateDraw(func() {
-				c.statusLine.SetText(status.Convert(err).Message())
-			})
-		}
 	}()
 }
 
+// func (c *Client) LikeMessage(topicName string, messageID int64) {
+// 	c.withRetry(func() error {
+// 		topicID, err := c.getTopicID(topicName)
+// 		if err != nil {
+// 			return fmt.Errorf("finding topic '%s': %w", topicName, err)
+// 		}
+
+// 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+// 		defer cancel()
+
+// 		msg, err := c.headClient.LikeMessage(ctx, &pb.LikeMessageRequest{
+// 			TopicId:   topicID,
+// 			MessageId: messageID,
+// 			UserId:    c.currentUser.Id,
+// 		})
+// 		if err != nil {
+// 			return err
+// 		}
+
+// 		fmt.Printf("Liked message: ID=%d, Likes=%d\n", msg.Id, msg.Likes)
+// 		return nil
+// 	})
+// }
+
+// func (c *Client) ListTopics() {
+// 	c.withRetry(func() error {
+// 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+// 		defer cancel()
+
+// 		resp, err := c.getReadClient().ListTopics(ctx, &emptypb.Empty{})
+// 		if err != nil {
+// 			return err
+// 		}
+
+// 		fmt.Println("Topics:")
+// 		for _, topic := range resp.Topics {
+// 			fmt.Printf("  [%d] %s\n", topic.Id, topic.Name)
+// 		}
+// 		return nil
+// 	})
+// }
+
+// func (c *Client) GetMessages(topicName string, fromID int64, limit int32) {
+// 	c.withRetry(func() error {
+// 		topicID, err := c.getTopicID(topicName)
+// 		if err != nil {
+// 			return fmt.Errorf("finding topic '%s': %w", topicName, err)
+// 		}
+
+// 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+// 		defer cancel()
+
+// 		resp, err := c.getReadClient().GetMessages(ctx, &pb.GetMessagesRequest{
+// 			TopicId:       topicID,
+// 			FromMessageId: fromID,
+// 			Limit:         limit,
+// 		})
+// 		if err != nil {
+// 			return err
+// 		}
+
+// 		fmt.Printf("Messages in topic '%s' (ID: %d):\n", topicName, topicID)
+// 		for _, msg := range resp.Messages {
+// 			fmt.Printf("  [%d] User %d: %s (Likes: %d)\n", msg.Id, msg.UserId, msg.Text, msg.Likes)
+// 		}
+// 		return nil
+// 	})
+// }
+
+// func (c *Client) GetMessagesByUser(topicName string, userName string, limit int32) {
+// 	c.withRetry(func() error {
+// 		topicID, err := c.getTopicID(topicName)
+// 		if err != nil {
+// 			return fmt.Errorf("finding topic '%s': %w", topicName, err)
+// 		}
+
+// 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+// 		defer cancel()
+
+// 		resp, err := c.getReadClient().GetMessagesByUser(ctx, &pb.GetMessagesByUserRequest{
+// 			TopicId:  topicID,
+// 			UserName: userName,
+// 			Limit:    limit,
+// 		})
+// 		if err != nil {
+// 			return err
+// 		}
+
+// 		fmt.Printf("Messages in topic '%s' (ID: %d) by user '%s':\n", topicName, topicID, userName)
+// 		for _, msg := range resp.Messages {
+// 			fmt.Printf("  [%d] User %d: %s (Likes: %d)\n", msg.Id, msg.UserId, msg.Text, msg.Likes)
+// 		}
+// 		return nil
+// 	})
+// }
+
 func (c *Client) Subscribe(ctx context.Context, topicNames []string) {
+	var lastMessageID int64 = 0
+
+	for {
+		err := c.subscribeInternal(ctx, topicNames, &lastMessageID)
+		if err == nil {
+			return
+		}
+
+		if s, ok := status.FromError(err); ok && s.Code() == codes.Canceled {
+			return
+		}
+
+		fmt.Printf("Subscription connection lost: %v. Reconnecting...\n", err)
+		time.Sleep(1 * time.Second)
+
+		if err := c.RefreshTopology(); err != nil {
+			fmt.Printf("Failed to refresh topology: %v. Retrying in 5s...\n", err)
+			time.Sleep(5 * time.Second)
+		}
+	}
+}
+
+func (c *Client) subscribeInternal(ctx context.Context, topicNames []string, lastMessageID *int64) error {
 	topicIDs := make([]int64, 0)
 	for _, name := range topicNames {
 		tid, err := c.getTopicID(name)
 		if err != nil {
-			continue
+			// fmt.Errorf("resolving topic %s: %w", name, err)
+			return err
 		}
 		topicIDs = append(topicIDs, tid)
 	}
 
 	if len(topicIDs) == 0 {
-		return
+		// fmt.Println("No valid topics to subscribe to.")
+		return nil
 	}
 
 	subCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -426,12 +622,13 @@ func (c *Client) Subscribe(ctx context.Context, topicNames []string) {
 		c.app.QueueUpdateDraw(func() {
 			c.statusLine.SetText(status.Convert(err).Message())
 		})
-		return
+		return err
 	}
 
 	conn, err := grpc.NewClient(subResp.Node.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		return
+		// fmt.Errorf("connecting to subscription node: %w", err)
+		return err
 	}
 	defer conn.Close()
 
@@ -440,17 +637,23 @@ func (c *Client) Subscribe(ctx context.Context, topicNames []string) {
 	stream, err := client.SubscribeTopic(ctx, &pb.SubscribeTopicRequest{
 		UserId:         c.currentUser.Id,
 		TopicId:        topicIDs,
-		FromMessageId:  0,
+		FromMessageId:  *lastMessageID,
 		SubscribeToken: subResp.SubscribeToken,
 	})
 	if err != nil {
-		return
+		// fmt.Errorf("subscribing: %w", err)
+		return err
 	}
 
 	for {
 		event, err := stream.Recv()
 		if err != nil {
-			return
+			// fmt.Errorf("stream error: %w", err)
+			return err
+		}
+
+		if event.Message != nil && event.Message.Id > *lastMessageID {
+			*lastMessageID = event.Message.Id
 		}
 
 		// Fetch username for the message
@@ -471,7 +674,7 @@ func (c *Client) getUserName(userID int64) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	user, err := c.tailClient.GetUserById(ctx, &pb.GetUserByIdRequest{Id: userID})
+	user, err := c.getReadClient().GetUserById(ctx, &pb.GetUserByIdRequest{Id: userID})
 	if err != nil {
 		return fmt.Sprintf("User %d", userID)
 	}
@@ -494,8 +697,13 @@ func (c *Client) showError(msg string) {
 func (c *Client) Close() {
 	if c.headConn != nil {
 		c.headConn.Close()
+		c.headConn = nil
 	}
-	if c.tailConn != nil {
-		c.tailConn.Close()
+	c.headClient = nil
+
+	for _, conn := range c.readConns {
+		conn.Close()
 	}
+	c.readConns = nil
+	c.readClients = nil
 }

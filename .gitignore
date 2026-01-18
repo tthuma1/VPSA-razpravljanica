@@ -2,3 +2,5 @@
 *.pids
 bin/
 logs/
+.idea
+*.sqlite

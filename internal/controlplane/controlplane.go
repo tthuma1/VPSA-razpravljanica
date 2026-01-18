@@ -26,6 +26,7 @@ type NodeState struct {
 	Info     *pb.NodeInfo
 	Healthy  bool
 	JoinedAt time.Time
+	Syncing  bool
 }
 
 func NewControlPlane() *ControlPlane {
@@ -50,10 +51,12 @@ func (cp *ControlPlane) RegisterNode(ctx context.Context, req *pb.RegisterNodeRe
 		Address: req.Address,
 	}
 
+	isFirst := len(cp.chain) == 0
 	cp.nodes[req.NodeId] = &NodeState{
 		Info:     nodeInfo,
 		Healthy:  true,
 		JoinedAt: time.Now(),
+		Syncing:  !isFirst,
 	}
 
 	cp.lastHeartbeat[req.NodeId] = time.Now()
@@ -86,9 +89,22 @@ func (cp *ControlPlane) GetClusterState(ctx context.Context, _ *emptypb.Empty) (
 		return nil, fmt.Errorf("no nodes in cluster")
 	}
 
+	var tail *pb.NodeInfo
+	// Iterate backwards to find the last node that is not syncing
+	for i := len(cp.chain) - 1; i >= 0; i-- {
+		node := cp.chain[i]
+		if state, exists := cp.nodes[node.NodeId]; exists && !state.Syncing {
+			tail = node
+			break
+		}
+	}
+	if tail == nil {
+		tail = cp.chain[len(cp.chain)-1]
+	}
+
 	response := &pb.GetClusterStateResponse{
 		Head: cp.chain[0],
-		Tail: cp.chain[len(cp.chain)-1],
+		Tail: tail,
 	}
 
 	return response, nil
@@ -101,6 +117,17 @@ func (cp *ControlPlane) GetChainState(ctx context.Context, _ *emptypb.Empty) (*p
 	return &pb.ChainStateResponse{
 		Chain: cp.chain,
 	}, nil
+}
+
+func (cp *ControlPlane) ConfirmSynced(ctx context.Context, req *pb.ConfirmSyncedRequest) (*emptypb.Empty, error) {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+
+	if state, exists := cp.nodes[req.NodeId]; exists {
+		state.Syncing = false
+		log.Printf("Node %s confirmed synced", req.NodeId)
+	}
+	return &emptypb.Empty{}, nil
 }
 
 func (cp *ControlPlane) monitorHealth() {
@@ -120,7 +147,7 @@ func (cp *ControlPlane) checkHealth() {
 	healthChanged := false
 
 	for nodeID, lastHB := range cp.lastHeartbeat {
-		if now.Sub(lastHB) > 15*time.Second {
+		if now.Sub(lastHB) > 5*time.Second {
 			if state, exists := cp.nodes[nodeID]; exists && state.Healthy {
 				log.Printf("Node %s marked unhealthy", nodeID)
 				state.Healthy = false

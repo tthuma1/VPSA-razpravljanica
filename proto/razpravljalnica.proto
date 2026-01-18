@@ -161,6 +161,11 @@ service ControlPlane {
   rpc RegisterNode(RegisterNodeRequest) returns (google.protobuf.Empty);
   rpc Heartbeat(HeartbeatRequest) returns (google.protobuf.Empty);
   rpc GetChainState(google.protobuf.Empty) returns (ChainStateResponse);
+  rpc ConfirmSynced(ConfirmSyncedRequest) returns (google.protobuf.Empty);
+}
+
+message ConfirmSyncedRequest {
+  string node_id = 1;
 }
 
 message GetClusterStateResponse {
@@ -187,8 +192,14 @@ message ChainStateResponse {
 
 service Replication {
   rpc ReplicateWrite(ReplicationRequest) returns (google.protobuf.Empty);
-  rpc SyncState(google.protobuf.Empty) returns (StateSnapshot);
+  rpc StreamLog(StreamLogRequest) returns (stream WriteOp);
   rpc NotifyEvent(MessageEvent) returns (google.protobuf.Empty);
+  rpc AcknowledgeWrite(AcknowledgeRequest) returns (google.protobuf.Empty);
+  rpc GetLastAcked(google.protobuf.Empty) returns (GetLastAckedResponse);
+}
+
+message StreamLogRequest {
+  int64 from_sequence = 1;
 }
 
 message ReplicationRequest {
@@ -205,10 +216,10 @@ message WriteOp {
   int64 sequence = 5;
 }
 
-message StateSnapshot {
-  repeated User users = 1;
-  repeated Topic topics = 2;
-  repeated Message messages = 3;
-  repeated Like likes = 4;
-  int64 last_sequence = 5;
+message AcknowledgeRequest {
+  int64 sequence = 1;
+}
+
+message GetLastAckedResponse {
+  int64 sequence = 1;
 }

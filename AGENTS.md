@@ -48,3 +48,6 @@ Generated gRPC stubs from razpravljalnica.proto. Provides client and server code
 - **Replication**: Chain replication ensures fault tolerance and consistency
 - **Subscriptions**: Real-time event streaming for topic updates
 - **Storage**: Per-node SQLite databases with sequence-based ordering
+
+### Makefile
+Contains build commands.
