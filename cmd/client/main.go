@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"regexp"
 	"time"
 
 	pb "messageboard/proto"
@@ -551,10 +552,26 @@ func (c *Client) LikeMessage(messageID int64) {
 					c.messageLiked[messageID] = true
 				}
 
-				// Redraw messages to show updated like count immediately
-				c.messageView.Clear()
-				for _, msg := range c.messages {
-					c.printMessage(msg)
+				// Update only the like region
+				currentLikes := c.messageLikes[messageID]
+				isLiked := c.messageLiked[messageID]
+
+				likeIcon := "♡"
+				likeColor := "white"
+				if isLiked {
+					likeIcon = "♥"
+					likeColor = "red"
+				}
+
+				regionID := fmt.Sprintf("like_%d", messageID)
+				newContent := fmt.Sprintf("[\"%s\"][%s]%s %d[\"\"]", regionID, likeColor, likeIcon, currentLikes)
+
+				text := c.messageView.GetText(false)
+				re := regexp.MustCompile(fmt.Sprintf(`\["%s"\](.*?)\[""\]`, regionID))
+				newText := re.ReplaceAllString(text, newContent)
+
+				if newText != text {
+					c.messageView.SetText(newText)
 				}
 
 				c.statusLine.SetText(fmt.Sprintf("Liked/Unliked message %d", messageID))
@@ -683,22 +700,44 @@ func (c *Client) subscribeInternal(ctx context.Context, topicNames []string, las
 				}
 			} else if event.Op == pb.OpType_OP_LIKE || event.Op == pb.OpType_OP_UNLIKE {
 				// Update like count
+				var msgID int64 = event.Message.Id
+				var currentLikes int32
+				var isLiked bool
+				found := false
+
 				for _, m := range c.messages {
-					if m.Id == event.Message.Id {
+					if m.Id == msgID {
 						m.Likes = event.Message.Likes
 						c.messageLikes[m.Id] = int(m.Likes)
 
 						if event.LikerId == c.currentUser.Id {
 							c.messageLiked[m.Id] = event.Message.IsLiked
 						}
+						currentLikes = m.Likes
+						isLiked = c.messageLiked[m.Id]
+						found = true
 						break
 					}
 				}
 
-				// Redraw all messages to update like counts
-				c.messageView.Clear()
-				for _, msg := range c.messages {
-					c.printMessage(msg)
+				if found {
+					likeIcon := "♡"
+					likeColor := "white"
+					if isLiked {
+						likeIcon = "♥"
+						likeColor = "red"
+					}
+
+					regionID := fmt.Sprintf("like_%d", msgID)
+					newContent := fmt.Sprintf("[\"%s\"][%s]%s %d[\"\"]", regionID, likeColor, likeIcon, currentLikes)
+
+					text := c.messageView.GetText(false)
+					re := regexp.MustCompile(fmt.Sprintf(`\["%s"\](.*?)\[""\]`, regionID))
+					newText := re.ReplaceAllString(text, newContent)
+
+					if newText != text {
+						c.messageView.SetText(newText)
+					}
 				}
 			}
 		})
