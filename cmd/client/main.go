@@ -179,15 +179,18 @@ func (c *Client) setupUI() {
 
 	leftPanel := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(c.topicList, 0, 1, true).
+		AddItem(nil, 1, 0, false).
 		AddItem(tview.NewButton("Create Topic").SetSelectedFunc(func() {
 			c.showCreateTopicForm()
 		}), 3, 0, false).
+		AddItem(nil, 1, 0, false).
 		AddItem(tview.NewButton("Refresh").SetSelectedFunc(func() {
 			c.refreshTopics()
 			if c.currentTopic != "" {
 				c.selectTopic(c.currentTopic)
 			}
 		}), 3, 0, false).
+		AddItem(nil, 1, 0, false).
 		AddItem(tview.NewButton("Logout").SetSelectedFunc(func() {
 			c.Logout()
 		}), 3, 0, false)
@@ -567,6 +570,8 @@ func (c *Client) LikeMessage(messageID int64) {
 				newContent := fmt.Sprintf("[\"%s\"][%s]%s %d[\"\"]", regionID, likeColor, likeIcon, currentLikes)
 
 				text := c.messageView.GetText(false)
+				// Find the like region
+				// TODO: this can probably be done better with GetRegionText
 				re := regexp.MustCompile(fmt.Sprintf(`\["%s"\](.*?)\[""\]`, regionID))
 				newText := re.ReplaceAllString(text, newContent)
 

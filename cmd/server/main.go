@@ -79,8 +79,6 @@ func main() {
 }
 
 func registerWithControlPlane(nodeID, address, controlAddr string, node *dataplane.Node) {
-	time.Sleep(1 * time.Second) // Wait for server to start
-
 	conn, err := grpc.NewClient(controlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Printf("Failed to connect to control plane: %v", err)
@@ -111,7 +109,7 @@ func registerWithControlPlane(nodeID, address, controlAddr string, node *datapla
 
 	hasSynced := false
 
-	for range ticker.C {
+	heartbeat := func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		_, err := client.Heartbeat(ctx, &pb.HeartbeatRequest{NodeId: nodeID})
 		cancel()
@@ -121,30 +119,39 @@ func registerWithControlPlane(nodeID, address, controlAddr string, node *datapla
 		}
 
 		// Get and update role
-		prevNode, err := updateRole(client, node)
-		if err != nil {
-			log.Printf("Failed to update role: %v", err)
-			continue
+		if hasSynced {
+			_, err := updateRole(client, node)
+			if err != nil {
+				log.Printf("Failed to update role: %v", err)
+				return
+			}
 		}
 
 		if !hasSynced {
-			if prevNode != "" {
-				log.Printf("Initiating sync with predecessor: %s", prevNode)
-				// Use a longer timeout for sync
-				syncCtx, syncCancel := context.WithTimeout(context.Background(), 30*time.Second)
-				if err := node.SyncWithTail(syncCtx); err != nil {
-					log.Printf("Sync failed: %v", err)
-					syncCancel()
-					continue // Retry next tick
-				}
+			log.Printf("Initiating sync with tail")
+			// Use a longer timeout for sync
+			syncCtx, syncCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			if err := node.SyncWithTail(syncCtx); err != nil {
+				log.Printf("Sync failed: %v", err)
 				syncCancel()
-				hasSynced = true
-				log.Printf("Sync completed successfully")
-			} else {
-				// No predecessor, assume synced (e.g. first node)
-				hasSynced = true
+				return // Retry next tick
+			}
+			syncCancel()
+			hasSynced = true
+			log.Printf("Sync completed successfully")
+
+			_, err := updateRole(client, node)
+			if err != nil {
+				log.Printf("Failed to update role: %v", err)
+				return
 			}
 		}
+	}
+
+	heartbeat()
+
+	for range ticker.C {
+		heartbeat()
 	}
 }
 
