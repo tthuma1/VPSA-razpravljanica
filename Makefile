@@ -1,6 +1,6 @@
 # Makefile
 
-.PHONY: all proto build clean run-control run-node1 run-node2 run-node3 run-client
+.PHONY: all proto build clean run-control run-node1 run-node2 run-node3 run-client test
 
 all: proto build
 
@@ -38,3 +38,7 @@ run-node3:
 # Run client
 run-client:
 	./bin/client
+
+# Run tests
+test:
+	go test ./test/... -v

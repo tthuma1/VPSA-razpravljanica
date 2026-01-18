@@ -9,32 +9,21 @@ import (
 	"regexp"
 	"time"
 
+	"messageboard/internal/client"
 	pb "messageboard/proto"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 var (
 	controlAddr = flag.String("control", "localhost:50050", "Control plane address")
 )
 
-type Client struct {
-	controlAddr string
-
-	headConn   *grpc.ClientConn
-	headClient pb.MessageBoardClient
-
-	readConns   []*grpc.ClientConn
-	readClients []pb.MessageBoardClient
-	readIndex   int
-
-	currentUser *pb.User
+type UIClient struct {
+	*client.Client
 
 	app          *tview.Application
 	pages        *tview.Pages
@@ -61,27 +50,29 @@ type Client struct {
 func main() {
 	flag.Parse()
 
-	client := &Client{
+	c := client.New()
+	uiClient := &UIClient{
+		Client:       c,
 		app:          tview.NewApplication(),
 		pages:        tview.NewPages(),
 		messageLikes: make(map[int64]int),
 		messageLiked: make(map[int64]bool),
 		messages:     make([]*pb.Message, 0),
 	}
-	defer client.Close()
+	defer uiClient.Close()
 
-	if err := client.Connect(*controlAddr); err != nil {
+	if err := uiClient.Connect(*controlAddr); err != nil {
 		log.Fatalf("Failed to connect: %v", err)
 	}
 
-	client.setupUI()
+	uiClient.setupUI()
 
-	if err := client.app.SetRoot(client.pages, true).EnableMouse(true).Run(); err != nil {
+	if err := uiClient.app.SetRoot(uiClient.pages, true).EnableMouse(true).Run(); err != nil {
 		panic(err)
 	}
 }
 
-func (c *Client) setupUI() {
+func (c *UIClient) setupUI() {
 	// Login Form
 	c.loginForm = tview.NewForm().
 		AddInputField("Username", "", 20, nil, nil).
@@ -89,7 +80,7 @@ func (c *Client) setupUI() {
 		AddButton("Login", func() {
 			username := c.loginForm.GetFormItem(0).(*tview.InputField).GetText()
 			password := c.loginForm.GetFormItem(1).(*tview.InputField).GetText()
-			c.LoginUser(username, password)
+			c.loginUser(username, password)
 		}).
 		AddButton("Go to Register", func() {
 			c.pages.SwitchToPage("register")
@@ -106,7 +97,7 @@ func (c *Client) setupUI() {
 		AddButton("Register", func() {
 			username := c.registerForm.GetFormItem(0).(*tview.InputField).GetText()
 			password := c.registerForm.GetFormItem(1).(*tview.InputField).GetText()
-			c.RegisterUser(username, password)
+			c.registerUser(username, password)
 		}).
 		AddButton("Back to Login", func() {
 			c.pages.SwitchToPage("login")
@@ -192,7 +183,7 @@ func (c *Client) setupUI() {
 		}), 3, 0, false).
 		AddItem(nil, 1, 0, false).
 		AddItem(tview.NewButton("Logout").SetSelectedFunc(func() {
-			c.Logout()
+			c.logout()
 		}), 3, 0, false)
 
 	rightPanel := tview.NewFlex().SetDirection(tview.FlexRow).
@@ -210,7 +201,7 @@ func (c *Client) setupUI() {
 	c.pages.AddPage("main", c.mainFlex, true, false)
 }
 
-func (c *Client) handleLikeClick(regionID string) {
+func (c *UIClient) handleLikeClick(regionID string) {
 	// Region ID format: "like_<msgID>"
 	var msgID int64
 	_, err := fmt.Sscanf(regionID, "like_%d", &msgID)
@@ -218,10 +209,10 @@ func (c *Client) handleLikeClick(regionID string) {
 		return
 	}
 
-	c.LikeMessage(msgID)
+	c.likeMessage(msgID)
 }
 
-func (c *Client) center(p tview.Primitive, width, height int) tview.Primitive {
+func (c *UIClient) center(p tview.Primitive, width, height int) tview.Primitive {
 	return tview.NewFlex().
 		AddItem(nil, 0, 1, false).
 		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
@@ -231,7 +222,7 @@ func (c *Client) center(p tview.Primitive, width, height int) tview.Primitive {
 		AddItem(nil, 0, 1, false)
 }
 
-func (c *Client) showMainUI() {
+func (c *UIClient) showMainUI() {
 	c.pages.SwitchToPage("main")
 	c.refreshTopics()
 
@@ -246,7 +237,7 @@ func (c *Client) showMainUI() {
 		SetSelectedBackgroundColor(tcell.ColorDefault)
 }
 
-func (c *Client) showCreateTopicForm() {
+func (c *UIClient) showCreateTopicForm() {
 	input := tview.NewInputField().SetLabel("Topic Name").SetFieldWidth(20)
 	form := tview.NewForm().
 		AddFormItem(input).
@@ -255,7 +246,7 @@ func (c *Client) showCreateTopicForm() {
 			if name != "" {
 				c.pages.RemovePage("create_topic_form")
 				go func() {
-					c.CreateTopic(name)
+					c.createTopic(name)
 					// Delay for it to reach tail TODO: mybe some improvements?
 					time.Sleep(500 * time.Millisecond)
 					c.app.QueueUpdateDraw(func() {
@@ -272,18 +263,18 @@ func (c *Client) showCreateTopicForm() {
 	c.pages.AddPage("create_topic_form", c.center(form, 40, 10), true, true)
 }
 
-func (c *Client) refreshTopics() {
+func (c *UIClient) refreshTopics() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	resp, err := c.getReadClient().ListTopics(ctx, &emptypb.Empty{})
+	topics, err := c.ListTopics(ctx)
 	if err != nil {
 		c.statusLine.SetText(fmt.Sprintf("Error listing topics: %v", err))
 		return
 	}
 
 	c.topicList.Clear()
-	for _, topic := range resp.Topics {
+	for _, topic := range topics {
 		c.topicList.AddItem(topic.Name, "", 0, nil)
 	}
 
@@ -292,7 +283,7 @@ func (c *Client) refreshTopics() {
 	}
 }
 
-func (c *Client) selectTopic(name string) {
+func (c *UIClient) selectTopic(name string) {
 	if c.cancelSub != nil {
 		c.cancelSub()
 		c.cancelSub = nil
@@ -312,148 +303,63 @@ func (c *Client) selectTopic(name string) {
 	// Start subscription
 	ctx, cancel := context.WithCancel(context.Background())
 	c.cancelSub = cancel
-	go c.Subscribe(ctx, []string{name})
+	go c.subscribe(ctx, []string{name})
 }
 
-func (c *Client) postMessage(text string) {
+func (c *UIClient) postMessage(text string) {
 	if c.currentTopic == "" {
 		c.statusLine.SetText("Please select a topic first.")
 		return
 	}
-	c.PostMessage(c.currentTopic, text)
-}
 
-// grcp client
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 
-func (c *Client) Connect(controlAddr string) error {
-	c.controlAddr = controlAddr
-	return c.RefreshTopology()
-}
-
-func (c *Client) RefreshTopology() error {
-	conn, err := grpc.NewClient(c.controlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return fmt.Errorf("failed to connect to control plane: %w", err)
-	}
-
-	client := pb.NewControlPlaneClient(conn)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	state, err := client.GetChainState(ctx, &emptypb.Empty{})
-	if err != nil {
-		return fmt.Errorf("failed to get chain state: %w", err)
-	}
-
-	if len(state.Chain) == 0 {
-		return fmt.Errorf("chain is empty")
-	}
-
-	// Close existing connections
-	c.Close()
-
-	// Connect to head
-	c.headConn, err = grpc.NewClient(state.Chain[0].Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return fmt.Errorf("failed to connect to head: %w", err)
-	}
-	c.headClient = pb.NewMessageBoardClient(c.headConn)
-
-	// Connect to all nodes for reading
-	c.readConns = make([]*grpc.ClientConn, 0, len(state.Chain))
-	c.readClients = make([]pb.MessageBoardClient, 0, len(state.Chain))
-
-	for _, node := range state.Chain {
-		conn, err := grpc.NewClient(node.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		err := c.PostMessage(ctx, c.currentTopic, text)
 		if err != nil {
-			fmt.Printf("Warning: failed to connect to node %s: %v\n", node.Address, err)
-			continue
+			c.app.QueueUpdateDraw(func() {
+				c.statusLine.SetText(status.Convert(err).Message())
+			})
 		}
-		c.readConns = append(c.readConns, conn)
-		c.readClients = append(c.readClients, pb.NewMessageBoardClient(conn))
-	}
-
-	if len(c.readClients) == 0 {
-		return fmt.Errorf("failed to connect to any nodes")
-	}
-
-	c.readIndex = 0
-	//fmt.Printf("Topology refreshed. Head: %s, Read nodes: %d\n", state.Chain[0].Address, len(c.readClients))
-	return nil
+	}()
 }
 
-func (c *Client) getReadClient() pb.MessageBoardClient {
-	if len(c.readClients) == 0 {
-		return c.headClient
-	}
-	client := c.readClients[c.readIndex]
-	c.readIndex = (c.readIndex + 1) % len(c.readClients)
-	return client
-}
-
-func (c *Client) withRetry(op func() error) {
-	err := op()
-	if err == nil {
-		return
-	}
-
-	// fmt.Printf("Operation failed: %v. Refreshing topology...\n", err)
-	if refreshErr := c.RefreshTopology(); refreshErr != nil {
-		// fmt.Printf("Failed to refresh topology: %v\n", refreshErr)
-		c.showError(status.Convert(err).Message())
-		return
-	}
-
-	if err := op(); err != nil {
-		// fmt.Printf("Operation failed after retry: %v\n", err)
-		c.showError(status.Convert(err).Message())
-	}
-}
-
-func (c *Client) RegisterUser(name, password string) {
+func (c *UIClient) registerUser(name, password string) {
 	go func() {
-		c.withRetry(func() error {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 
-			user, err := c.headClient.CreateUser(ctx, &pb.CreateUserRequest{Name: name, Password: password})
-			if err != nil {
-				c.showError(status.Convert(err).Message())
-				return err
-			}
+		err := c.RegisterUser(ctx, name, password)
+		if err != nil {
+			c.showError(status.Convert(err).Message())
+			return
+		}
 
-			c.app.QueueUpdateDraw(func() {
-				c.currentUser = user
-				c.showMainUI()
-			})
-			return nil
+		c.app.QueueUpdateDraw(func() {
+			c.showMainUI()
 		})
 	}()
 }
 
-func (c *Client) LoginUser(name, password string) {
+func (c *UIClient) loginUser(name, password string) {
 	go func() {
-		c.withRetry(func() error {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 
-			user, err := c.getReadClient().Login(ctx, &pb.LoginRequest{Name: name, Password: password})
-			if err != nil {
-				c.showError(status.Convert(err).Message())
-				return err
-			}
+		err := c.LoginUser(ctx, name, password)
+		if err != nil {
+			c.showError(status.Convert(err).Message())
+			return
+		}
 
-			c.app.QueueUpdateDraw(func() {
-				c.currentUser = user
-				c.showMainUI()
-			})
-			return nil
+		c.app.QueueUpdateDraw(func() {
+			c.showMainUI()
 		})
 	}()
 }
 
-func (c *Client) Logout() {
-	c.currentUser = nil
+func (c *UIClient) logout() {
 	if c.cancelSub != nil {
 		c.cancelSub()
 	}
@@ -478,130 +384,71 @@ func (c *Client) Logout() {
 	c.pages.SwitchToPage("login")
 }
 
-func (c *Client) CreateTopic(name string) {
-	c.withRetry(func() error {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		_, err := c.headClient.CreateTopic(ctx, &pb.CreateTopicRequest{Name: name})
-		if err != nil {
-			c.showError(status.Convert(err).Message())
-		}
-		return nil
-	})
-}
-
-func (c *Client) getTopicID(name string) (int64, error) {
+func (c *UIClient) createTopic(name string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	topic, err := c.getReadClient().GetTopic(ctx, &pb.GetTopicRequest{Name: name})
+	err := c.CreateTopic(ctx, name)
 	if err != nil {
-		return 0, err
+		c.showError(status.Convert(err).Message())
 	}
-	return topic.Id, nil
 }
 
-func (c *Client) PostMessage(topicName string, text string) {
+func (c *UIClient) likeMessage(messageID int64) {
 	go func() {
-		c.withRetry(func() error {
-			topicID, err := c.getTopicID(topicName)
-			if err != nil {
-				c.app.QueueUpdateDraw(func() {
-					c.statusLine.SetText(status.Convert(err).Message())
-				})
-				return err
+		// Optimistic update
+		c.app.QueueUpdateDraw(func() {
+			liked := c.messageLiked[messageID]
+			if liked {
+				c.messageLikes[messageID]--
+				c.messageLiked[messageID] = false
+			} else {
+				c.messageLikes[messageID]++
+				c.messageLiked[messageID] = true
 			}
 
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
+			// Update only the like region
+			currentLikes := c.messageLikes[messageID]
+			isLiked := c.messageLiked[messageID]
 
-			_, err = c.headClient.PostMessage(ctx, &pb.PostMessageRequest{
-				TopicId: topicID,
-				UserId:  c.currentUser.Id,
-				Text:    text,
-			})
-			if err != nil {
-				c.app.QueueUpdateDraw(func() {
-					c.statusLine.SetText(status.Convert(err).Message())
-				})
-				return err
+			likeIcon := "♡"
+			likeColor := "white"
+			if isLiked {
+				likeIcon = "♥"
+				likeColor = "red"
 			}
 
-			return nil
+			regionID := fmt.Sprintf("like_%d", messageID)
+			newContent := fmt.Sprintf("[\"%s\"][%s]%s %d[\"\"]", regionID, likeColor, likeIcon, currentLikes)
+
+			text := c.messageView.GetText(false)
+			// Find the like region
+			re := regexp.MustCompile(fmt.Sprintf(`\["%s"\](.*?)\[""\]`, regionID))
+			newText := re.ReplaceAllString(text, newContent)
+
+			if newText != text {
+				c.messageView.SetText(newText)
+			}
+
+			c.statusLine.SetText(fmt.Sprintf("Liked/Unliked message %d", messageID))
 		})
-	}()
-}
 
-func (c *Client) LikeMessage(messageID int64) {
-	go func() {
-		c.withRetry(func() error {
-			topicID, err := c.getTopicID(c.currentTopic)
-			if err != nil {
-				return fmt.Errorf("finding topic '%s': %w", c.currentTopic, err)
-			}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-
-			// Optimistic update
+		// We need to pass the current topic name to SetMessageLike
+		err := c.SetMessageLike(ctx, c.currentTopic, messageID, c.messageLiked[messageID])
+		if err != nil {
+			// Revert optimistic update on error
 			c.app.QueueUpdateDraw(func() {
-				liked := c.messageLiked[messageID]
-				if liked {
-					c.messageLikes[messageID]--
-					c.messageLiked[messageID] = false
-				} else {
-					c.messageLikes[messageID]++
-					c.messageLiked[messageID] = true
-				}
-
-				// Update only the like region
-				currentLikes := c.messageLikes[messageID]
-				isLiked := c.messageLiked[messageID]
-
-				likeIcon := "♡"
-				likeColor := "white"
-				if isLiked {
-					likeIcon = "♥"
-					likeColor = "red"
-				}
-
-				regionID := fmt.Sprintf("like_%d", messageID)
-				newContent := fmt.Sprintf("[\"%s\"][%s]%s %d[\"\"]", regionID, likeColor, likeIcon, currentLikes)
-
-				text := c.messageView.GetText(false)
-				// Find the like region
-				// TODO: this can probably be done better with GetRegionText
-				re := regexp.MustCompile(fmt.Sprintf(`\["%s"\](.*?)\[""\]`, regionID))
-				newText := re.ReplaceAllString(text, newContent)
-
-				if newText != text {
-					c.messageView.SetText(newText)
-				}
-
-				c.statusLine.SetText(fmt.Sprintf("Liked/Unliked message %d", messageID))
+				// Revert logic...
+				c.statusLine.SetText(fmt.Sprintf("Failed to like message: %v", err))
 			})
-
-			_, err = c.headClient.LikeMessage(ctx, &pb.LikeMessageRequest{
-				TopicId:   topicID,
-				MessageId: messageID,
-				UserId:    c.currentUser.Id,
-			})
-			if err != nil {
-				// Revert optimistic update on error
-				c.app.QueueUpdateDraw(func() {
-					// Revert logic...
-					c.statusLine.SetText(fmt.Sprintf("Failed to like message: %v", err))
-				})
-				return err
-			}
-
-			return nil
-		})
+		}
 	}()
 }
 
-func (c *Client) Subscribe(ctx context.Context, topicNames []string) {
+func (c *UIClient) subscribe(ctx context.Context, topicNames []string) {
 	var lastMessageID int64 = 0
 
 	for {
@@ -624,27 +471,30 @@ func (c *Client) Subscribe(ctx context.Context, topicNames []string) {
 	}
 }
 
-func (c *Client) subscribeInternal(ctx context.Context, topicNames []string, lastMessageID *int64) error {
+func (c *UIClient) subscribeInternal(ctx context.Context, topicNames []string, lastMessageID *int64) error {
+	allTopics, err := c.ListTopics(ctx)
+	if err != nil {
+		return err
+	}
+
+	topicMap := make(map[string]int64)
+	for _, t := range allTopics {
+		topicMap[t.Name] = t.Id
+	}
+
 	topicIDs := make([]int64, 0)
 	for _, name := range topicNames {
-		tid, err := c.getTopicID(name)
-		if err != nil {
-			// fmt.Errorf("resolving topic %s: %w", name, err)
-			return err
+		if tid, ok := topicMap[name]; ok {
+			topicIDs = append(topicIDs, tid)
 		}
-		topicIDs = append(topicIDs, tid)
 	}
 
 	if len(topicIDs) == 0 {
-		// fmt.Println("No valid topics to subscribe to.")
 		return nil
 	}
 
 	subCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	subResp, err := c.headClient.GetSubscriptionNode(subCtx, &pb.SubscriptionNodeRequest{
-		UserId:  c.currentUser.Id,
-		TopicId: topicIDs,
-	})
+	subResp, err := c.GetSubscriptionNode(subCtx, topicIDs)
 	cancel()
 	if err != nil {
 		c.app.QueueUpdateDraw(func() {
@@ -653,30 +503,14 @@ func (c *Client) subscribeInternal(ctx context.Context, topicNames []string, las
 		return err
 	}
 
-	conn, err := grpc.NewClient(subResp.Node.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	stream, err := c.SubscribeTopic(ctx, subResp.Node.Address, topicIDs, *lastMessageID, subResp.SubscribeToken)
 	if err != nil {
-		// fmt.Errorf("connecting to subscription node: %w", err)
-		return err
-	}
-	defer conn.Close()
-
-	client := pb.NewMessageBoardClient(conn)
-
-	stream, err := client.SubscribeTopic(ctx, &pb.SubscribeTopicRequest{
-		UserId:         c.currentUser.Id,
-		TopicId:        topicIDs,
-		FromMessageId:  *lastMessageID,
-		SubscribeToken: subResp.SubscribeToken,
-	})
-	if err != nil {
-		// fmt.Errorf("subscribing: %w", err)
 		return err
 	}
 
 	for {
 		event, err := stream.Recv()
 		if err != nil {
-			// fmt.Errorf("stream error: %w", err)
 			return err
 		}
 
@@ -715,7 +549,7 @@ func (c *Client) subscribeInternal(ctx context.Context, topicNames []string, las
 						m.Likes = event.Message.Likes
 						c.messageLikes[m.Id] = int(m.Likes)
 
-						if event.LikerId == c.currentUser.Id {
+						if event.LikerId == c.Client.GetCurrentUserId() {
 							c.messageLiked[m.Id] = event.Message.IsLiked
 						}
 						currentLikes = m.Likes
@@ -749,7 +583,7 @@ func (c *Client) subscribeInternal(ctx context.Context, topicNames []string, las
 	}
 }
 
-func (c *Client) printMessage(msg *pb.Message) {
+func (c *UIClient) printMessage(msg *pb.Message) {
 	userName := c.getUserName(msg.UserId)
 
 	// Determine heart icon and color
@@ -771,15 +605,15 @@ func (c *Client) printMessage(msg *pb.Message) {
 	fmt.Fprintf(c.messageView, "   [\"%s\"][%s]%s %d[\"\"]\n", regionID, likeColor, likeIcon, likes)
 }
 
-func (c *Client) getUserName(userID int64) string {
-	if c.currentUser != nil && c.currentUser.Id == userID {
-		return c.currentUser.Name
+func (c *UIClient) getUserName(userID int64) string {
+	if c.Client.IsCurrentUser(userID) {
+		return c.Client.GetCurrentUserName()
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	user, err := c.getReadClient().GetUserById(ctx, &pb.GetUserByIdRequest{Id: userID})
+	user, err := c.GetUserById(ctx, userID)
 	if err != nil {
 		return fmt.Sprintf("User %d", userID)
 	}
@@ -787,7 +621,7 @@ func (c *Client) getUserName(userID int64) string {
 	return user.Name
 }
 
-func (c *Client) showError(msg string) {
+func (c *UIClient) showError(msg string) {
 	c.app.QueueUpdateDraw(func() {
 		modal := tview.NewModal().
 			SetText(msg).
@@ -797,18 +631,4 @@ func (c *Client) showError(msg string) {
 			})
 		c.pages.AddPage("error", modal, true, true)
 	})
-}
-
-func (c *Client) Close() {
-	if c.headConn != nil {
-		c.headConn.Close()
-		c.headConn = nil
-	}
-	c.headClient = nil
-
-	for _, conn := range c.readConns {
-		conn.Close()
-	}
-	c.readConns = nil
-	c.readClients = nil
 }
