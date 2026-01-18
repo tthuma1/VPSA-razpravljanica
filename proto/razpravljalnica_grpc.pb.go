@@ -25,6 +25,7 @@ const (
 	MessageBoard_CreateUser_FullMethodName          = "/razpravljalnica.MessageBoard/CreateUser"
 	MessageBoard_Login_FullMethodName               = "/razpravljalnica.MessageBoard/Login"
 	MessageBoard_GetUser_FullMethodName             = "/razpravljalnica.MessageBoard/GetUser"
+	MessageBoard_GetUserById_FullMethodName         = "/razpravljalnica.MessageBoard/GetUserById"
 	MessageBoard_CreateTopic_FullMethodName         = "/razpravljalnica.MessageBoard/CreateTopic"
 	MessageBoard_GetTopic_FullMethodName            = "/razpravljalnica.MessageBoard/GetTopic"
 	MessageBoard_PostMessage_FullMethodName         = "/razpravljalnica.MessageBoard/PostMessage"
@@ -43,6 +44,7 @@ type MessageBoardClient interface {
 	CreateUser(ctx context.Context, in *CreateUserRequest, opts ...grpc.CallOption) (*User, error)
 	Login(ctx context.Context, in *LoginRequest, opts ...grpc.CallOption) (*User, error)
 	GetUser(ctx context.Context, in *GetUserRequest, opts ...grpc.CallOption) (*User, error)
+	GetUserById(ctx context.Context, in *GetUserByIdRequest, opts ...grpc.CallOption) (*User, error)
 	CreateTopic(ctx context.Context, in *CreateTopicRequest, opts ...grpc.CallOption) (*Topic, error)
 	GetTopic(ctx context.Context, in *GetTopicRequest, opts ...grpc.CallOption) (*Topic, error)
 	PostMessage(ctx context.Context, in *PostMessageRequest, opts ...grpc.CallOption) (*Message, error)
@@ -86,6 +88,16 @@ func (c *messageBoardClient) GetUser(ctx context.Context, in *GetUserRequest, op
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(User)
 	err := c.cc.Invoke(ctx, MessageBoard_GetUser_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *messageBoardClient) GetUserById(ctx context.Context, in *GetUserByIdRequest, opts ...grpc.CallOption) (*User, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(User)
+	err := c.cc.Invoke(ctx, MessageBoard_GetUserById_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -198,6 +210,7 @@ type MessageBoardServer interface {
 	CreateUser(context.Context, *CreateUserRequest) (*User, error)
 	Login(context.Context, *LoginRequest) (*User, error)
 	GetUser(context.Context, *GetUserRequest) (*User, error)
+	GetUserById(context.Context, *GetUserByIdRequest) (*User, error)
 	CreateTopic(context.Context, *CreateTopicRequest) (*Topic, error)
 	GetTopic(context.Context, *GetTopicRequest) (*Topic, error)
 	PostMessage(context.Context, *PostMessageRequest) (*Message, error)
@@ -225,6 +238,9 @@ func (UnimplementedMessageBoardServer) Login(context.Context, *LoginRequest) (*U
 }
 func (UnimplementedMessageBoardServer) GetUser(context.Context, *GetUserRequest) (*User, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetUser not implemented")
+}
+func (UnimplementedMessageBoardServer) GetUserById(context.Context, *GetUserByIdRequest) (*User, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetUserById not implemented")
 }
 func (UnimplementedMessageBoardServer) CreateTopic(context.Context, *CreateTopicRequest) (*Topic, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateTopic not implemented")
@@ -324,6 +340,24 @@ func _MessageBoard_GetUser_Handler(srv interface{}, ctx context.Context, dec fun
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(MessageBoardServer).GetUser(ctx, req.(*GetUserRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _MessageBoard_GetUserById_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetUserByIdRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MessageBoardServer).GetUserById(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MessageBoard_GetUserById_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MessageBoardServer).GetUserById(ctx, req.(*GetUserByIdRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -501,6 +535,10 @@ var MessageBoard_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetUser",
 			Handler:    _MessageBoard_GetUser_Handler,
+		},
+		{
+			MethodName: "GetUserById",
+			Handler:    _MessageBoard_GetUserById_Handler,
 		},
 		{
 			MethodName: "CreateTopic",
