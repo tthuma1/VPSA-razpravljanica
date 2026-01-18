@@ -132,7 +132,7 @@ func registerWithControlPlane(nodeID, address, controlAddr string, node *datapla
 				log.Printf("Initiating sync with predecessor: %s", prevNode)
 				// Use a longer timeout for sync
 				syncCtx, syncCancel := context.WithTimeout(context.Background(), 30*time.Second)
-				if err := node.SyncWithPredecessor(syncCtx, prevNode); err != nil {
+				if err := node.SyncWithTail(syncCtx); err != nil {
 					log.Printf("Sync failed: %v", err)
 					syncCancel()
 					continue // Retry next tick

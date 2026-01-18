@@ -101,6 +101,9 @@ func NewNode(nodeID, address, dbPath, controlAddr string) (*Node, error) {
 func (n *Node) SetRole(role NodeRole, nextNode, prevNode string) {
 	n.topologyMu.Lock()
 	defer n.topologyMu.Unlock()
+	if n.role == role && n.nextNode == nextNode && n.prevNode == prevNode {
+		return
+	}
 	n.role = role
 	n.nextNode = nextNode
 	n.prevNode = prevNode
@@ -567,6 +570,10 @@ func (n *Node) ReplicateWrite(ctx context.Context, req *pb.ReplicationRequest) (
 	} else if n.role == RoleTail {
 		// If we are the tail, we acknowledge the write to the previous node
 		n.ackQueue <- op.Sequence
+		// Also update our own last acked sequence
+		if err := n.storage.UpdateLastAcked(op.Sequence); err != nil {
+			log.Printf("Failed to update last acked: %v", err)
+		}
 	}
 
 	return &emptypb.Empty{}, nil
@@ -621,6 +628,11 @@ func (n *Node) NotifyEvent(ctx context.Context, event *pb.MessageEvent) (*emptyp
 }
 
 func (n *Node) AcknowledgeWrite(ctx context.Context, req *pb.AcknowledgeRequest) (*emptypb.Empty, error) {
+	// Persist acknowledgement
+	if err := n.storage.UpdateLastAcked(req.Sequence); err != nil {
+		log.Printf("Failed to persist acknowledgement for seq %d: %v", req.Sequence, err)
+	}
+
 	n.pendingMu.Lock()
 	ch, exists := n.pendingWrites[req.Sequence]
 	delete(n.pendingWrites, req.Sequence)
@@ -635,6 +647,14 @@ func (n *Node) AcknowledgeWrite(ctx context.Context, req *pb.AcknowledgeRequest)
 		n.ackQueue <- req.Sequence
 	}
 	return &emptypb.Empty{}, nil
+}
+
+func (n *Node) GetLastAcked(ctx context.Context, _ *emptypb.Empty) (*pb.GetLastAckedResponse, error) {
+	seq, err := n.storage.GetLastAcked()
+	if err != nil {
+		return nil, err
+	}
+	return &pb.GetLastAckedResponse{Sequence: seq}, nil
 }
 
 func (n *Node) runReplicationWorker() {
@@ -800,7 +820,7 @@ func (n *Node) StreamLog(req *pb.StreamLogRequest, stream pb.Replication_StreamL
 	return nil
 }
 
-func (n *Node) SyncWithPredecessor(ctx context.Context, predAddr string) error {
+func (n *Node) SyncWithTail(ctx context.Context) error {
 	n.syncMu.Lock()
 	n.syncing = true
 	n.syncMu.Unlock()
@@ -811,9 +831,29 @@ func (n *Node) SyncWithPredecessor(ctx context.Context, predAddr string) error {
 		n.syncMu.Unlock()
 	}()
 
-	log.Printf("Starting sync with predecessor %s", predAddr)
+	// Get tail node from control plane
+	cpConn, err := grpc.NewClient(n.controlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return fmt.Errorf("failed to connect to control plane: %v", err)
+	}
+	defer cpConn.Close()
+	cpClient := pb.NewControlPlaneClient(cpConn)
 
-	conn, err := grpc.NewClient(predAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	state, err := cpClient.GetClusterState(ctx, &emptypb.Empty{})
+	if err != nil {
+		return fmt.Errorf("failed to get cluster state: %v", err)
+	}
+
+	if state.Tail == nil {
+		log.Printf("No tail node found, skipping sync")
+		_, err = cpClient.ConfirmSynced(ctx, &pb.ConfirmSyncedRequest{NodeId: n.nodeID})
+		return err
+	}
+
+	tailAddr := state.Tail.Address
+	log.Printf("Starting sync with tail node %s", tailAddr)
+
+	conn, err := grpc.NewClient(tailAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return err
 	}
@@ -841,21 +881,20 @@ func (n *Node) SyncWithPredecessor(ctx context.Context, predAddr string) error {
 			return fmt.Errorf("stream error: %v", err)
 		}
 		// Apply op
+		log.Printf("Applying %d, %s", op.Sequence, op.Operation)
 		if err := n.applyWriteOp(op); err != nil {
 			return fmt.Errorf("failed to apply op %d: %v", op.Sequence, err)
+		}
+
+		// Update last acked sequence since we received it from tail
+		if err := n.storage.UpdateLastAcked(op.Sequence); err != nil {
+			log.Printf("Failed to update last acked during sync: %v", err)
 		}
 	}
 
 	log.Printf("Sync completed")
 
 	// Confirm Synced
-	cpConn, err := grpc.NewClient(n.controlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return fmt.Errorf("failed to connect to control plane: %v", err)
-	}
-	defer cpConn.Close()
-	cpClient := pb.NewControlPlaneClient(cpConn)
-
 	_, err = cpClient.ConfirmSynced(ctx, &pb.ConfirmSyncedRequest{NodeId: n.nodeID})
 	if err != nil {
 		return fmt.Errorf("failed to confirm synced: %v", err)

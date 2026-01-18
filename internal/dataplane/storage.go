@@ -76,10 +76,11 @@ func (s *Storage) initSchema() error {
 
 	CREATE TABLE IF NOT EXISTS sequence (
 		id INTEGER PRIMARY KEY CHECK (id = 1),
-		last_seq INTEGER DEFAULT 0
+		last_seq INTEGER DEFAULT 0,
+		last_acked_seq INTEGER DEFAULT 0
 	);
 
-	INSERT OR IGNORE INTO sequence (id, last_seq) VALUES (1, 0);
+	INSERT OR IGNORE INTO sequence (id, last_seq, last_acked_seq) VALUES (1, 0, 0);
 
 	CREATE TABLE IF NOT EXISTS operation_log (
 		sequence_id INTEGER PRIMARY KEY,
@@ -402,6 +403,38 @@ func (s *Storage) GetLastSequence() int64 {
 	var seq int64
 	s.db.QueryRow("SELECT last_seq FROM sequence WHERE id = 1").Scan(&seq)
 	return seq
+}
+
+func (s *Storage) UpdateLastAcked(seq int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec("UPDATE sequence SET last_acked_seq = ? WHERE id = 1 AND last_acked_seq < ?", seq, seq)
+	return err
+}
+
+func (s *Storage) GetLastAcked() (int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var seq int64
+	err := s.db.QueryRow("SELECT last_acked_seq FROM sequence WHERE id = 1").Scan(&seq)
+	if err != nil {
+		return 0, err
+	}
+	return seq, nil
+}
+
+func (s *Storage) GetSyncState() (int64, int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var lastSeq, lastAcked int64
+	err := s.db.QueryRow("SELECT last_seq, last_acked_seq FROM sequence WHERE id = 1").Scan(&lastSeq, &lastAcked)
+	if err != nil {
+		return 0, 0, err
+	}
+	return lastSeq, lastAcked, nil
 }
 
 func (s *Storage) Close() error {

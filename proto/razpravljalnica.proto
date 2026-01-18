@@ -190,6 +190,7 @@ service Replication {
   rpc StreamLog(StreamLogRequest) returns (stream WriteOp);
   rpc NotifyEvent(MessageEvent) returns (google.protobuf.Empty);
   rpc AcknowledgeWrite(AcknowledgeRequest) returns (google.protobuf.Empty);
+  rpc GetLastAcked(google.protobuf.Empty) returns (GetLastAckedResponse);
 }
 
 message StreamLogRequest {
@@ -211,5 +212,9 @@ message WriteOp {
 }
 
 message AcknowledgeRequest {
+  int64 sequence = 1;
+}
+
+message GetLastAckedResponse {
   int64 sequence = 1;
 }

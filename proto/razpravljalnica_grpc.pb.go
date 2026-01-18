@@ -804,6 +804,7 @@ const (
 	Replication_StreamLog_FullMethodName        = "/razpravljalnica.Replication/StreamLog"
 	Replication_NotifyEvent_FullMethodName      = "/razpravljalnica.Replication/NotifyEvent"
 	Replication_AcknowledgeWrite_FullMethodName = "/razpravljalnica.Replication/AcknowledgeWrite"
+	Replication_GetLastAcked_FullMethodName     = "/razpravljalnica.Replication/GetLastAcked"
 )
 
 // ReplicationClient is the client API for Replication service.
@@ -814,6 +815,7 @@ type ReplicationClient interface {
 	StreamLog(ctx context.Context, in *StreamLogRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[WriteOp], error)
 	NotifyEvent(ctx context.Context, in *MessageEvent, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	AcknowledgeWrite(ctx context.Context, in *AcknowledgeRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	GetLastAcked(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*GetLastAckedResponse, error)
 }
 
 type replicationClient struct {
@@ -873,6 +875,16 @@ func (c *replicationClient) AcknowledgeWrite(ctx context.Context, in *Acknowledg
 	return out, nil
 }
 
+func (c *replicationClient) GetLastAcked(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*GetLastAckedResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetLastAckedResponse)
+	err := c.cc.Invoke(ctx, Replication_GetLastAcked_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ReplicationServer is the server API for Replication service.
 // All implementations must embed UnimplementedReplicationServer
 // for forward compatibility.
@@ -881,6 +893,7 @@ type ReplicationServer interface {
 	StreamLog(*StreamLogRequest, grpc.ServerStreamingServer[WriteOp]) error
 	NotifyEvent(context.Context, *MessageEvent) (*emptypb.Empty, error)
 	AcknowledgeWrite(context.Context, *AcknowledgeRequest) (*emptypb.Empty, error)
+	GetLastAcked(context.Context, *emptypb.Empty) (*GetLastAckedResponse, error)
 	mustEmbedUnimplementedReplicationServer()
 }
 
@@ -902,6 +915,9 @@ func (UnimplementedReplicationServer) NotifyEvent(context.Context, *MessageEvent
 }
 func (UnimplementedReplicationServer) AcknowledgeWrite(context.Context, *AcknowledgeRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method AcknowledgeWrite not implemented")
+}
+func (UnimplementedReplicationServer) GetLastAcked(context.Context, *emptypb.Empty) (*GetLastAckedResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetLastAcked not implemented")
 }
 func (UnimplementedReplicationServer) mustEmbedUnimplementedReplicationServer() {}
 func (UnimplementedReplicationServer) testEmbeddedByValue()                     {}
@@ -989,6 +1005,24 @@ func _Replication_AcknowledgeWrite_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Replication_GetLastAcked_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ReplicationServer).GetLastAcked(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Replication_GetLastAcked_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ReplicationServer).GetLastAcked(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Replication_ServiceDesc is the grpc.ServiceDesc for Replication service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1007,6 +1041,10 @@ var Replication_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "AcknowledgeWrite",
 			Handler:    _Replication_AcknowledgeWrite_Handler,
+		},
+		{
+			MethodName: "GetLastAcked",
+			Handler:    _Replication_GetLastAcked_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

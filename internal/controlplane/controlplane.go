@@ -89,9 +89,22 @@ func (cp *ControlPlane) GetClusterState(ctx context.Context, _ *emptypb.Empty) (
 		return nil, fmt.Errorf("no nodes in cluster")
 	}
 
+	var tail *pb.NodeInfo
+	// Iterate backwards to find the last node that is not syncing
+	for i := len(cp.chain) - 1; i >= 0; i-- {
+		node := cp.chain[i]
+		if state, exists := cp.nodes[node.NodeId]; exists && !state.Syncing {
+			tail = node
+			break
+		}
+	}
+	if tail == nil {
+		tail = cp.chain[len(cp.chain)-1]
+	}
+
 	response := &pb.GetClusterStateResponse{
 		Head: cp.chain[0],
-		Tail: cp.chain[len(cp.chain)-1],
+		Tail: tail,
 	}
 
 	return response, nil
