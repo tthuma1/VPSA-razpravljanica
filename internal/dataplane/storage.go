@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -138,7 +139,7 @@ func (s *Storage) VerifyUser(name, password string) (*pb.User, error) {
 
 	err := s.db.QueryRow("SELECT id, name, password_hash, salt FROM users WHERE name = ?", name).Scan(&user.Id, &user.Name, &storedHash, &salt)
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil, fmt.Errorf("invalid credentials")
 		}
 		return nil, err
@@ -160,7 +161,7 @@ func (s *Storage) GetUserByName(name string) (*pb.User, error) {
 	var user pb.User
 	err := s.db.QueryRow("SELECT id, name, password_hash, salt FROM users WHERE name = ?", name).Scan(&user.Id, &user.Name, &user.PasswordHash, &user.Salt)
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil // User not found
 		}
 		return nil, err
@@ -203,7 +204,7 @@ func (s *Storage) GetTopicByName(name string) (*pb.Topic, error) {
 	var topic pb.Topic
 	err := s.db.QueryRow("SELECT id, name FROM topics WHERE name = ?", name).Scan(&topic.Id, &topic.Name)
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil // Topic not found
 		}
 		return nil, err
