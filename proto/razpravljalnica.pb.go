@@ -28,8 +28,9 @@ const (
 type OpType int32
 
 const (
-	OpType_OP_POST OpType = 0
-	OpType_OP_LIKE OpType = 1
+	OpType_OP_POST   OpType = 0
+	OpType_OP_LIKE   OpType = 1
+	OpType_OP_UNLIKE OpType = 2
 )
 
 // Enum value maps for OpType.
@@ -37,10 +38,12 @@ var (
 	OpType_name = map[int32]string{
 		0: "OP_POST",
 		1: "OP_LIKE",
+		2: "OP_UNLIKE",
 	}
 	OpType_value = map[string]int32{
-		"OP_POST": 0,
-		"OP_LIKE": 1,
+		"OP_POST":   0,
+		"OP_LIKE":   1,
+		"OP_UNLIKE": 2,
 	}
 )
 
@@ -199,6 +202,7 @@ type Message struct {
 	Text          string                 `protobuf:"bytes,4,opt,name=text,proto3" json:"text,omitempty"`
 	CreatedAt     *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
 	Likes         int32                  `protobuf:"varint,6,opt,name=likes,proto3" json:"likes,omitempty"`
+	IsLiked       bool                   `protobuf:"varint,7,opt,name=is_liked,json=isLiked,proto3" json:"is_liked,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -273,6 +277,13 @@ func (x *Message) GetLikes() int32 {
 		return x.Likes
 	}
 	return 0
+}
+
+func (x *Message) GetIsLiked() bool {
+	if x != nil {
+		return x.IsLiked
+	}
+	return false
 }
 
 type Like struct {
@@ -740,6 +751,7 @@ type LikeMessageRequest struct {
 	TopicId       int64                  `protobuf:"varint,1,opt,name=topic_id,json=topicId,proto3" json:"topic_id,omitempty"`
 	MessageId     int64                  `protobuf:"varint,2,opt,name=message_id,json=messageId,proto3" json:"message_id,omitempty"`
 	UserId        int64                  `protobuf:"varint,3,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`
+	Like          bool                   `protobuf:"varint,4,opt,name=like,proto3" json:"like,omitempty"` // true = like, false = unlike
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -795,6 +807,13 @@ func (x *LikeMessageRequest) GetUserId() int64 {
 	return 0
 }
 
+func (x *LikeMessageRequest) GetLike() bool {
+	if x != nil {
+		return x.Like
+	}
+	return false
+}
+
 type ListTopicsResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Topics        []*Topic               `protobuf:"bytes,1,rep,name=topics,proto3" json:"topics,omitempty"`
@@ -844,6 +863,7 @@ type GetMessagesRequest struct {
 	TopicId       int64                  `protobuf:"varint,1,opt,name=topic_id,json=topicId,proto3" json:"topic_id,omitempty"`
 	FromMessageId int64                  `protobuf:"varint,2,opt,name=from_message_id,json=fromMessageId,proto3" json:"from_message_id,omitempty"`
 	Limit         int32                  `protobuf:"varint,3,opt,name=limit,proto3" json:"limit,omitempty"`
+	RequestUserId int64                  `protobuf:"varint,4,opt,name=request_user_id,json=requestUserId,proto3" json:"request_user_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -899,11 +919,19 @@ func (x *GetMessagesRequest) GetLimit() int32 {
 	return 0
 }
 
+func (x *GetMessagesRequest) GetRequestUserId() int64 {
+	if x != nil {
+		return x.RequestUserId
+	}
+	return 0
+}
+
 type GetMessagesByUserRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	TopicId       int64                  `protobuf:"varint,1,opt,name=topic_id,json=topicId,proto3" json:"topic_id,omitempty"`
 	UserName      string                 `protobuf:"bytes,2,opt,name=user_name,json=userName,proto3" json:"user_name,omitempty"`
 	Limit         int32                  `protobuf:"varint,3,opt,name=limit,proto3" json:"limit,omitempty"`
+	RequestUserId int64                  `protobuf:"varint,4,opt,name=request_user_id,json=requestUserId,proto3" json:"request_user_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -955,6 +983,13 @@ func (x *GetMessagesByUserRequest) GetUserName() string {
 func (x *GetMessagesByUserRequest) GetLimit() int32 {
 	if x != nil {
 		return x.Limit
+	}
+	return 0
+}
+
+func (x *GetMessagesByUserRequest) GetRequestUserId() int64 {
+	if x != nil {
+		return x.RequestUserId
 	}
 	return 0
 }
@@ -1181,6 +1216,7 @@ type MessageEvent struct {
 	Op             OpType                 `protobuf:"varint,2,opt,name=op,proto3,enum=razpravljalnica.OpType" json:"op,omitempty"`
 	Message        *Message               `protobuf:"bytes,3,opt,name=message,proto3" json:"message,omitempty"`
 	EventAt        *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=event_at,json=eventAt,proto3" json:"event_at,omitempty"`
+	LikerId        int64                  `protobuf:"varint,5,opt,name=liker_id,json=likerId,proto3" json:"liker_id,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -1241,6 +1277,13 @@ func (x *MessageEvent) GetEventAt() *timestamppb.Timestamp {
 		return x.EventAt
 	}
 	return nil
+}
+
+func (x *MessageEvent) GetLikerId() int64 {
+	if x != nil {
+		return x.LikerId
+	}
+	return 0
 }
 
 type ConfirmSyncedRequest struct {
@@ -1789,7 +1832,7 @@ const file_proto_razpravljalnica_proto_rawDesc = "" +
 	"\x04salt\x18\x04 \x01(\tR\x04salt\"+\n" +
 	"\x05Topic\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\x03R\x02id\x12\x12\n" +
-	"\x04name\x18\x02 \x01(\tR\x04name\"\xb2\x01\n" +
+	"\x04name\x18\x02 \x01(\tR\x04name\"\xcd\x01\n" +
 	"\aMessage\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\x03R\x02id\x12\x19\n" +
 	"\btopic_id\x18\x02 \x01(\x03R\atopicId\x12\x17\n" +
@@ -1797,7 +1840,8 @@ const file_proto_razpravljalnica_proto_rawDesc = "" +
 	"\x04text\x18\x04 \x01(\tR\x04text\x129\n" +
 	"\n" +
 	"created_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\x12\x14\n" +
-	"\x05likes\x18\x06 \x01(\x05R\x05likes\"Y\n" +
+	"\x05likes\x18\x06 \x01(\x05R\x05likes\x12\x19\n" +
+	"\bis_liked\x18\a \x01(\bR\aisLiked\"Y\n" +
 	"\x04Like\x12\x19\n" +
 	"\btopic_id\x18\x01 \x01(\x03R\atopicId\x12\x1d\n" +
 	"\n" +
@@ -1824,22 +1868,25 @@ const file_proto_razpravljalnica_proto_rawDesc = "" +
 	"\x12PostMessageRequest\x12\x19\n" +
 	"\btopic_id\x18\x01 \x01(\x03R\atopicId\x12\x17\n" +
 	"\auser_id\x18\x02 \x01(\x03R\x06userId\x12\x12\n" +
-	"\x04text\x18\x03 \x01(\tR\x04text\"g\n" +
+	"\x04text\x18\x03 \x01(\tR\x04text\"{\n" +
 	"\x12LikeMessageRequest\x12\x19\n" +
 	"\btopic_id\x18\x01 \x01(\x03R\atopicId\x12\x1d\n" +
 	"\n" +
 	"message_id\x18\x02 \x01(\x03R\tmessageId\x12\x17\n" +
-	"\auser_id\x18\x03 \x01(\x03R\x06userId\"D\n" +
+	"\auser_id\x18\x03 \x01(\x03R\x06userId\x12\x12\n" +
+	"\x04like\x18\x04 \x01(\bR\x04like\"D\n" +
 	"\x12ListTopicsResponse\x12.\n" +
-	"\x06topics\x18\x01 \x03(\v2\x16.razpravljalnica.TopicR\x06topics\"m\n" +
+	"\x06topics\x18\x01 \x03(\v2\x16.razpravljalnica.TopicR\x06topics\"\x95\x01\n" +
 	"\x12GetMessagesRequest\x12\x19\n" +
 	"\btopic_id\x18\x01 \x01(\x03R\atopicId\x12&\n" +
 	"\x0ffrom_message_id\x18\x02 \x01(\x03R\rfromMessageId\x12\x14\n" +
-	"\x05limit\x18\x03 \x01(\x05R\x05limit\"h\n" +
+	"\x05limit\x18\x03 \x01(\x05R\x05limit\x12&\n" +
+	"\x0frequest_user_id\x18\x04 \x01(\x03R\rrequestUserId\"\x90\x01\n" +
 	"\x18GetMessagesByUserRequest\x12\x19\n" +
 	"\btopic_id\x18\x01 \x01(\x03R\atopicId\x12\x1b\n" +
 	"\tuser_name\x18\x02 \x01(\tR\buserName\x12\x14\n" +
-	"\x05limit\x18\x03 \x01(\x05R\x05limit\"K\n" +
+	"\x05limit\x18\x03 \x01(\x05R\x05limit\x12&\n" +
+	"\x0frequest_user_id\x18\x04 \x01(\x03R\rrequestUserId\"K\n" +
 	"\x13GetMessagesResponse\x124\n" +
 	"\bmessages\x18\x01 \x03(\v2\x18.razpravljalnica.MessageR\bmessages\"\x9c\x01\n" +
 	"\x15SubscribeTopicRequest\x12\x19\n" +
@@ -1852,12 +1899,13 @@ const file_proto_razpravljalnica_proto_rawDesc = "" +
 	"\btopic_id\x18\x02 \x03(\x03R\atopicId\"r\n" +
 	"\x18SubscriptionNodeResponse\x12'\n" +
 	"\x0fsubscribe_token\x18\x01 \x01(\tR\x0esubscribeToken\x12-\n" +
-	"\x04node\x18\x02 \x01(\v2\x19.razpravljalnica.NodeInfoR\x04node\"\xcb\x01\n" +
+	"\x04node\x18\x02 \x01(\v2\x19.razpravljalnica.NodeInfoR\x04node\"\xe6\x01\n" +
 	"\fMessageEvent\x12'\n" +
 	"\x0fsequence_number\x18\x01 \x01(\x03R\x0esequenceNumber\x12'\n" +
 	"\x02op\x18\x02 \x01(\x0e2\x17.razpravljalnica.OpTypeR\x02op\x122\n" +
 	"\amessage\x18\x03 \x01(\v2\x18.razpravljalnica.MessageR\amessage\x125\n" +
-	"\bevent_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\aeventAt\"/\n" +
+	"\bevent_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\aeventAt\x12\x19\n" +
+	"\bliker_id\x18\x05 \x01(\x03R\alikerId\"/\n" +
 	"\x14ConfirmSyncedRequest\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\"w\n" +
 	"\x17GetClusterStateResponse\x12-\n" +
@@ -1885,10 +1933,11 @@ const file_proto_razpravljalnica_proto_rawDesc = "" +
 	"\x12AcknowledgeRequest\x12\x1a\n" +
 	"\bsequence\x18\x01 \x01(\x03R\bsequence\"2\n" +
 	"\x14GetLastAckedResponse\x12\x1a\n" +
-	"\bsequence\x18\x01 \x01(\x03R\bsequence*\"\n" +
+	"\bsequence\x18\x01 \x01(\x03R\bsequence*1\n" +
 	"\x06OpType\x12\v\n" +
 	"\aOP_POST\x10\x00\x12\v\n" +
-	"\aOP_LIKE\x10\x012\xa4\b\n" +
+	"\aOP_LIKE\x10\x01\x12\r\n" +
+	"\tOP_UNLIKE\x10\x022\xa4\b\n" +
 	"\fMessageBoard\x12G\n" +
 	"\n" +
 	"CreateUser\x12\".razpravljalnica.CreateUserRequest\x1a\x15.razpravljalnica.User\x12=\n" +

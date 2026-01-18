@@ -47,14 +47,25 @@ type Client struct {
 
 	currentTopic string
 	cancelSub    context.CancelFunc
+
+	// Messages for the current topic
+	messages []*pb.Message
+
+	// Map message ID to current like count
+	messageLikes map[int64]int
+	// Map message ID to whether current user liked it
+	messageLiked map[int64]bool
 }
 
 func main() {
 	flag.Parse()
 
 	client := &Client{
-		app:   tview.NewApplication(),
-		pages: tview.NewPages(),
+		app:          tview.NewApplication(),
+		pages:        tview.NewPages(),
+		messageLikes: make(map[int64]int),
+		messageLiked: make(map[int64]bool),
+		messages:     make([]*pb.Message, 0),
 	}
 	defer client.Close()
 
@@ -125,6 +136,25 @@ func (c *Client) setupUI() {
 		})
 	c.messageView.SetBorder(true).SetTitle("Messages")
 
+	// Handle clicks on regions (like buttons)
+	c.messageView.SetMouseCapture(func(action tview.MouseAction, event *tcell.EventMouse) (tview.MouseAction, *tcell.EventMouse) {
+		if action == tview.MouseLeftClick {
+			// We need to wait for the click to be processed by TextView so it updates highlights
+			go func() {
+				time.Sleep(50 * time.Millisecond)
+				c.app.QueueUpdate(func() {
+					highlights := c.messageView.GetHighlights()
+					if len(highlights) > 0 {
+						regionID := highlights[0]
+						c.handleLikeClick(regionID)
+						c.messageView.Highlight() // Clear highlights
+					}
+				})
+			}()
+		}
+		return action, event
+	})
+
 	c.inputField = tview.NewInputField().
 		SetLabel("Message: ").
 		SetFieldWidth(0).
@@ -151,6 +181,12 @@ func (c *Client) setupUI() {
 		AddItem(tview.NewButton("Create Topic").SetSelectedFunc(func() {
 			c.showCreateTopicForm()
 		}), 3, 0, false).
+		AddItem(tview.NewButton("Refresh").SetSelectedFunc(func() {
+			c.refreshTopics()
+			if c.currentTopic != "" {
+				c.selectTopic(c.currentTopic)
+			}
+		}), 3, 0, false).
 		AddItem(tview.NewButton("Logout").SetSelectedFunc(func() {
 			c.Logout()
 		}), 3, 0, false)
@@ -168,6 +204,17 @@ func (c *Client) setupUI() {
 	c.pages.AddPage("login", c.center(c.loginForm, 40, 15), true, true)
 	c.pages.AddPage("register", c.center(c.registerForm, 40, 15), true, false)
 	c.pages.AddPage("main", c.mainFlex, true, false)
+}
+
+func (c *Client) handleLikeClick(regionID string) {
+	// Region ID format: "like_<msgID>"
+	var msgID int64
+	_, err := fmt.Sscanf(regionID, "like_%d", &msgID)
+	if err != nil {
+		return
+	}
+
+	c.LikeMessage(msgID)
 }
 
 func (c *Client) center(p tview.Primitive, width, height int) tview.Primitive {
@@ -253,6 +300,11 @@ func (c *Client) selectTopic(name string) {
 	c.statusLine.SetText(fmt.Sprintf("Joined topic: %s", name))
 	c.app.SetFocus(c.inputField)
 
+	// Reset message tracking for new topic
+	c.messages = make([]*pb.Message, 0)
+	c.messageLikes = make(map[int64]int)
+	c.messageLiked = make(map[int64]bool)
+
 	// Start subscription
 	ctx, cancel := context.WithCancel(context.Background())
 	c.cancelSub = cancel
@@ -322,7 +374,7 @@ func (c *Client) RefreshTopology() error {
 	}
 
 	c.readIndex = 0
-	fmt.Printf("Topology refreshed. Head: %s, Read nodes: %d\n", state.Chain[0].Address, len(c.readClients))
+	//fmt.Printf("Topology refreshed. Head: %s, Read nodes: %d\n", state.Chain[0].Address, len(c.readClients))
 	return nil
 }
 
@@ -477,101 +529,55 @@ func (c *Client) PostMessage(topicName string, text string) {
 	}()
 }
 
-// func (c *Client) LikeMessage(topicName string, messageID int64) {
-// 	c.withRetry(func() error {
-// 		topicID, err := c.getTopicID(topicName)
-// 		if err != nil {
-// 			return fmt.Errorf("finding topic '%s': %w", topicName, err)
-// 		}
+func (c *Client) LikeMessage(messageID int64) {
+	go func() {
+		c.withRetry(func() error {
+			topicID, err := c.getTopicID(c.currentTopic)
+			if err != nil {
+				return fmt.Errorf("finding topic '%s': %w", c.currentTopic, err)
+			}
 
-// 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-// 		defer cancel()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
 
-// 		msg, err := c.headClient.LikeMessage(ctx, &pb.LikeMessageRequest{
-// 			TopicId:   topicID,
-// 			MessageId: messageID,
-// 			UserId:    c.currentUser.Id,
-// 		})
-// 		if err != nil {
-// 			return err
-// 		}
+			// Optimistic update
+			c.app.QueueUpdateDraw(func() {
+				liked := c.messageLiked[messageID]
+				if liked {
+					c.messageLikes[messageID]--
+					c.messageLiked[messageID] = false
+				} else {
+					c.messageLikes[messageID]++
+					c.messageLiked[messageID] = true
+				}
 
-// 		fmt.Printf("Liked message: ID=%d, Likes=%d\n", msg.Id, msg.Likes)
-// 		return nil
-// 	})
-// }
+				// Redraw messages to show updated like count immediately
+				c.messageView.Clear()
+				for _, msg := range c.messages {
+					c.printMessage(msg)
+				}
 
-// func (c *Client) ListTopics() {
-// 	c.withRetry(func() error {
-// 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-// 		defer cancel()
+				c.statusLine.SetText(fmt.Sprintf("Liked/Unliked message %d", messageID))
+			})
 
-// 		resp, err := c.getReadClient().ListTopics(ctx, &emptypb.Empty{})
-// 		if err != nil {
-// 			return err
-// 		}
+			_, err = c.headClient.LikeMessage(ctx, &pb.LikeMessageRequest{
+				TopicId:   topicID,
+				MessageId: messageID,
+				UserId:    c.currentUser.Id,
+			})
+			if err != nil {
+				// Revert optimistic update on error
+				c.app.QueueUpdateDraw(func() {
+					// Revert logic...
+					c.statusLine.SetText(fmt.Sprintf("Failed to like message: %v", err))
+				})
+				return err
+			}
 
-// 		fmt.Println("Topics:")
-// 		for _, topic := range resp.Topics {
-// 			fmt.Printf("  [%d] %s\n", topic.Id, topic.Name)
-// 		}
-// 		return nil
-// 	})
-// }
-
-// func (c *Client) GetMessages(topicName string, fromID int64, limit int32) {
-// 	c.withRetry(func() error {
-// 		topicID, err := c.getTopicID(topicName)
-// 		if err != nil {
-// 			return fmt.Errorf("finding topic '%s': %w", topicName, err)
-// 		}
-
-// 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-// 		defer cancel()
-
-// 		resp, err := c.getReadClient().GetMessages(ctx, &pb.GetMessagesRequest{
-// 			TopicId:       topicID,
-// 			FromMessageId: fromID,
-// 			Limit:         limit,
-// 		})
-// 		if err != nil {
-// 			return err
-// 		}
-
-// 		fmt.Printf("Messages in topic '%s' (ID: %d):\n", topicName, topicID)
-// 		for _, msg := range resp.Messages {
-// 			fmt.Printf("  [%d] User %d: %s (Likes: %d)\n", msg.Id, msg.UserId, msg.Text, msg.Likes)
-// 		}
-// 		return nil
-// 	})
-// }
-
-// func (c *Client) GetMessagesByUser(topicName string, userName string, limit int32) {
-// 	c.withRetry(func() error {
-// 		topicID, err := c.getTopicID(topicName)
-// 		if err != nil {
-// 			return fmt.Errorf("finding topic '%s': %w", topicName, err)
-// 		}
-
-// 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-// 		defer cancel()
-
-// 		resp, err := c.getReadClient().GetMessagesByUser(ctx, &pb.GetMessagesByUserRequest{
-// 			TopicId:  topicID,
-// 			UserName: userName,
-// 			Limit:    limit,
-// 		})
-// 		if err != nil {
-// 			return err
-// 		}
-
-// 		fmt.Printf("Messages in topic '%s' (ID: %d) by user '%s':\n", topicName, topicID, userName)
-// 		for _, msg := range resp.Messages {
-// 			fmt.Printf("  [%d] User %d: %s (Likes: %d)\n", msg.Id, msg.UserId, msg.Text, msg.Likes)
-// 		}
-// 		return nil
-// 	})
-// }
+			return nil
+		})
+	}()
+}
 
 func (c *Client) Subscribe(ctx context.Context, topicNames []string) {
 	var lastMessageID int64 = 0
@@ -652,18 +658,73 @@ func (c *Client) subscribeInternal(ctx context.Context, topicNames []string, las
 			return err
 		}
 
-		if event.Message != nil && event.Message.Id > *lastMessageID {
-			*lastMessageID = event.Message.Id
-		}
-
-		// Fetch username for the message
-		userName := c.getUserName(event.Message.UserId)
-
 		c.app.QueueUpdateDraw(func() {
-			fmt.Fprintf(c.messageView, "[yellow]%s[white]: %s\n", userName, event.Message.Text)
-			c.messageView.ScrollToEnd()
+			if event.Op == pb.OpType_OP_POST {
+				if event.Message != nil && event.Message.Id > *lastMessageID {
+					*lastMessageID = event.Message.Id
+				}
+
+				// Check if we already have this message (deduplication)
+				exists := false
+				for _, m := range c.messages {
+					if m.Id == event.Message.Id {
+						exists = true
+						break
+					}
+				}
+
+				if !exists {
+					c.messages = append(c.messages, event.Message)
+					c.messageLikes[event.Message.Id] = int(event.Message.Likes)
+					c.messageLiked[event.Message.Id] = event.Message.IsLiked
+
+					// Append to view
+					c.printMessage(event.Message)
+				}
+			} else if event.Op == pb.OpType_OP_LIKE || event.Op == pb.OpType_OP_UNLIKE {
+				// Update like count
+				for _, m := range c.messages {
+					if m.Id == event.Message.Id {
+						m.Likes = event.Message.Likes
+						c.messageLikes[m.Id] = int(m.Likes)
+
+						if event.LikerId == c.currentUser.Id {
+							c.messageLiked[m.Id] = event.Message.IsLiked
+						}
+						break
+					}
+				}
+
+				// Redraw all messages to update like counts
+				c.messageView.Clear()
+				for _, msg := range c.messages {
+					c.printMessage(msg)
+				}
+			}
 		})
 	}
+}
+
+func (c *Client) printMessage(msg *pb.Message) {
+	userName := c.getUserName(msg.UserId)
+
+	// Determine heart icon and color
+	likeIcon := "♡"
+	likeColor := "white"
+	if c.messageLiked[msg.Id] {
+		likeIcon = "♥"
+		likeColor = "red"
+	}
+
+	likes := c.messageLikes[msg.Id]
+
+	// Format: [User]: Message
+	//         [LikeButton] Count
+	fmt.Fprintf(c.messageView, "[yellow]%s[white]: %s\n", userName, msg.Text)
+
+	// Create a region for the like button
+	regionID := fmt.Sprintf("like_%d", msg.Id)
+	fmt.Fprintf(c.messageView, "   [\"%s\"][%s]%s %d[\"\"]\n", regionID, likeColor, likeIcon, likes)
 }
 
 func (c *Client) getUserName(userID int64) string {

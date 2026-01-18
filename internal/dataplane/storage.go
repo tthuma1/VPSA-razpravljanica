@@ -282,13 +282,31 @@ func (s *Storage) LikeMessage(topicID, messageID, userID int64) (*pb.Message, er
 		return nil, fmt.Errorf("message does not exist")
 	}
 
-	// Insert like (ignore if already liked)
-	_, err = s.db.Exec(
-		"INSERT OR IGNORE INTO likes (topic_id, message_id, user_id) VALUES (?, ?, ?)",
-		topicID, messageID, userID,
-	)
+	// Check if already liked
+	var liked int
+	err = s.db.QueryRow("SELECT COUNT(*) FROM likes WHERE message_id = ? AND user_id = ?", messageID, userID).Scan(&liked)
 	if err != nil {
 		return nil, err
+	}
+
+	if liked > 0 {
+		// Unlike
+		_, err = s.db.Exec(
+			"DELETE FROM likes WHERE message_id = ? AND user_id = ?",
+			messageID, userID,
+		)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		// Like
+		_, err = s.db.Exec(
+			"INSERT INTO likes (topic_id, message_id, user_id) VALUES (?, ?, ?)",
+			topicID, messageID, userID,
+		)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Update like count
@@ -300,10 +318,10 @@ func (s *Storage) LikeMessage(topicID, messageID, userID int64) (*pb.Message, er
 		return nil, err
 	}
 
-	return s.GetMessage(messageID)
+	return s.GetMessage(messageID, userID)
 }
 
-func (s *Storage) GetMessage(messageID int64) (*pb.Message, error) {
+func (s *Storage) GetMessage(messageID int64, userID int64) (*pb.Message, error) {
 	var msg pb.Message
 	var createdAt int64
 
@@ -314,6 +332,16 @@ func (s *Storage) GetMessage(messageID int64) (*pb.Message, error) {
 
 	if err != nil {
 		return nil, err
+	}
+
+	// Check if liked by user
+	if userID != 0 {
+		var liked int
+		err = s.db.QueryRow("SELECT COUNT(*) FROM likes WHERE message_id = ? AND user_id = ?", messageID, userID).Scan(&liked)
+		if err != nil {
+			return nil, err
+		}
+		msg.IsLiked = liked > 0
 	}
 
 	msg.CreatedAt = timestamppb.New(time.Unix(createdAt, 0))
@@ -342,7 +370,7 @@ func (s *Storage) ListTopics() ([]*pb.Topic, error) {
 	return topics, rows.Err()
 }
 
-func (s *Storage) GetMessages(topicID, fromMessageID int64, limit int32) ([]*pb.Message, error) {
+func (s *Storage) GetMessages(topicID, fromMessageID int64, limit int32, requestUserID int64) ([]*pb.Message, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -363,13 +391,24 @@ func (s *Storage) GetMessages(topicID, fromMessageID int64, limit int32) ([]*pb.
 			return nil, err
 		}
 		msg.CreatedAt = timestamppb.New(time.Unix(createdAt, 0))
+
+		// Check if liked by user
+		if requestUserID != 0 {
+			var liked int
+			err = s.db.QueryRow("SELECT COUNT(*) FROM likes WHERE message_id = ? AND user_id = ?", msg.Id, requestUserID).Scan(&liked)
+			if err != nil {
+				return nil, err
+			}
+			msg.IsLiked = liked > 0
+		}
+
 		messages = append(messages, &msg)
 	}
 
 	return messages, rows.Err()
 }
 
-func (s *Storage) GetMessagesByUser(topicID int64, userName string, limit int32) ([]*pb.Message, error) {
+func (s *Storage) GetMessagesByUser(topicID int64, userName string, limit int32, requestUserID int64) ([]*pb.Message, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -399,6 +438,17 @@ func (s *Storage) GetMessagesByUser(topicID int64, userName string, limit int32)
 			return nil, err
 		}
 		msg.CreatedAt = timestamppb.New(time.Unix(createdAt, 0))
+
+		// Check if liked by user
+		if requestUserID != 0 {
+			var liked int
+			err = s.db.QueryRow("SELECT COUNT(*) FROM likes WHERE message_id = ? AND user_id = ?", msg.Id, requestUserID).Scan(&liked)
+			if err != nil {
+				return nil, err
+			}
+			msg.IsLiked = liked > 0
+		}
+
 		messages = append(messages, &msg)
 	}
 

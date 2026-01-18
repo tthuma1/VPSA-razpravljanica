@@ -397,6 +397,7 @@ func (n *Node) LikeMessage(ctx context.Context, req *pb.LikeMessageRequest) (*pb
 		Op:             pb.OpType_OP_LIKE,
 		Message:        msg,
 		EventAt:        timestamppb.Now(),
+		LikerId:        req.UserId,
 	}
 
 	n.broadcastEvent(event)
@@ -464,7 +465,7 @@ func (n *Node) GetMessages(ctx context.Context, req *pb.GetMessagesRequest) (*pb
 		return n.forwardGetMessagesToTail(ctx, req)
 	}
 
-	messages, err := n.storage.GetMessages(req.TopicId, req.FromMessageId, req.Limit)
+	messages, err := n.storage.GetMessages(req.TopicId, req.FromMessageId, req.Limit, req.RequestUserId)
 	if err != nil {
 		return nil, err
 	}
@@ -481,7 +482,7 @@ func (n *Node) GetMessagesByUser(ctx context.Context, req *pb.GetMessagesByUserR
 		return n.forwardGetMessagesByUserToTail(ctx, req)
 	}
 
-	messages, err := n.storage.GetMessagesByUser(req.TopicId, req.UserName, req.Limit)
+	messages, err := n.storage.GetMessagesByUser(req.TopicId, req.UserName, req.Limit, req.RequestUserId)
 	if err != nil {
 		return nil, err
 	}
@@ -535,7 +536,7 @@ func (n *Node) SubscribeTopic(req *pb.SubscribeTopicRequest, stream pb.MessageBo
 
 	// Send historical messages
 	for _, topicID := range sub.TopicIDs {
-		messages, err := n.storage.GetMessages(topicID, sub.FromMessageID, 1000)
+		messages, err := n.storage.GetMessages(topicID, sub.FromMessageID, 1000, req.UserId)
 		if err != nil {
 			continue
 		}
