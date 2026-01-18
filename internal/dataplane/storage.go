@@ -174,15 +174,17 @@ func (s *Storage) GetUserById(id int64) (*pb.User, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	log.Printf("Getting user by ID: %d", id)
 	var user pb.User
 	err := s.db.QueryRow("SELECT id, name, password_hash, salt FROM users WHERE id = ?", id).Scan(&user.Id, &user.Name, &user.PasswordHash, &user.Salt)
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil // User not found
 		}
 		return nil, err
 	}
 
+	log.Printf("Found user: %s", user.String())
 	return &user, nil
 }
 
@@ -480,6 +482,8 @@ func hashPassword(password, salt string) string {
 func (s *Storage) LogOperation(op *pb.WriteOp) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	log.Printf("Performing operation: %s", op)
 
 	// This gets called when LogOperation is called from the head (sequence number for the passed operation is not generated yet)
 	if op.Sequence == 0 {

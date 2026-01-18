@@ -217,8 +217,8 @@ func (n *Node) GetUser(ctx context.Context, req *pb.GetUserRequest) (*pb.User, e
 }
 
 func (n *Node) GetUserById(ctx context.Context, req *pb.GetUserByIdRequest) (*pb.User, error) {
-	if n.role != RoleTail {
-		return nil, fmt.Errorf("not the tail node")
+	if n.role != RoleTail && n.hasPendingWrites() {
+		return n.forwardGetUserByIDToTail(ctx, req)
 	}
 
 	user, err := n.storage.GetUserById(req.Id)
@@ -986,6 +986,15 @@ func (n *Node) forwardGetMessagesByUserToTail(ctx context.Context, req *pb.GetMe
 	}
 	defer conn.Close()
 	return client.GetMessagesByUser(ctx, req)
+}
+
+func (n *Node) forwardGetUserByIDToTail(ctx context.Context, req *pb.GetUserByIdRequest) (*pb.User, error) {
+	client, conn, err := n.getTailClient()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	return client.GetUserById(ctx, req)
 }
 
 func (n *Node) getTailClient() (pb.MessageBoardClient, *grpc.ClientConn, error) {
