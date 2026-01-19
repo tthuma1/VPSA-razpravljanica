@@ -411,6 +411,8 @@ func (s *Storage) ListTopics(userID int64) ([]*pb.Topic, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	log.Printf("Storage ListTopics called with userID: %d", userID)
+
 	var rows *sql.Rows
 	var err error
 
@@ -546,10 +548,19 @@ func (s *Storage) GetMessagesByUser(topicID int64, userName string, limit int32,
 		return nil, fmt.Errorf("user not found")
 	}
 
-	rows, err := s.db.Query(
-		"SELECT id, topic_id, user_id, text, created_at, likes FROM messages WHERE topic_id = ? AND user_id = ? ORDER BY id DESC LIMIT ?",
-		topicID, user.Id, limit,
-	)
+	var rows *sql.Rows
+	if topicID == 0 {
+		rows, err = s.db.Query(
+			"SELECT id, topic_id, user_id, text, created_at, likes FROM messages WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+			user.Id, limit,
+		)
+	} else {
+		rows, err = s.db.Query(
+			"SELECT id, topic_id, user_id, text, created_at, likes FROM messages WHERE topic_id = ? AND user_id = ? ORDER BY id DESC LIMIT ?",
+			topicID, user.Id, limit,
+		)
+	}
+
 	if err != nil {
 		return nil, err
 	}

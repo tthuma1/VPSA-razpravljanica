@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"regexp"
+	"strings"
 	"time"
 
 	"messageboard/internal/client"
@@ -138,7 +139,11 @@ func (c *UIClient) setupUI() {
 					highlights := c.messageView.GetHighlights()
 					if len(highlights) > 0 {
 						regionID := highlights[0]
-						c.handleLikeClick(regionID)
+						if strings.HasPrefix(regionID, "like_") {
+							c.handleLikeClick(regionID)
+						} else if strings.HasPrefix(regionID, "user_") {
+							c.handleUserClick(regionID)
+						}
 						c.messageView.Highlight() // Clear highlights
 					}
 				})
@@ -214,6 +219,58 @@ func (c *UIClient) handleLikeClick(regionID string) {
 	}
 
 	c.likeMessage(msgID)
+}
+
+func (c *UIClient) handleUserClick(regionID string) {
+	var userID int64
+	_, err := fmt.Sscanf(regionID, "user_%d", &userID)
+	if err != nil {
+		return
+	}
+	c.showUserProfile(userID)
+}
+
+func (c *UIClient) showUserProfile(userID int64) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		user, err := c.GetUserById(ctx, userID)
+		if err != nil {
+			c.showError(fmt.Sprintf("Failed to get user profile: %v", err))
+			return
+		}
+
+		messages, err := c.GetMessagesByUser(ctx, 0, user.Name, 10)
+		if err != nil {
+			c.showError(fmt.Sprintf("Failed to get user messages: %v", err))
+			return
+		}
+
+		c.app.QueueUpdateDraw(func() {
+			textView := tview.NewTextView().
+				SetDynamicColors(true).
+				SetWordWrap(true)
+			textView.SetBorder(true).SetTitle(fmt.Sprintf("Profile: %s (ID: %d)", user.Name, user.Id))
+
+			fmt.Fprintf(textView, "[yellow]Recent Messages:[white]\n\n")
+			if len(messages) == 0 {
+				fmt.Fprintf(textView, "No messages found.")
+			} else {
+				for _, msg := range messages {
+					fmt.Fprintf(textView, "- %s\n", msg.Text)
+				}
+			}
+
+			flex := tview.NewFlex().SetDirection(tview.FlexRow).
+				AddItem(textView, 0, 1, false).
+				AddItem(tview.NewButton("Close").SetSelectedFunc(func() {
+					c.pages.RemovePage("user_profile")
+				}), 3, 0, true)
+
+			c.pages.AddPage("user_profile", c.center(flex, 60, 20), true, true)
+		})
+	}()
 }
 
 func (c *UIClient) center(p tview.Primitive, width, height int) tview.Primitive {
@@ -656,7 +713,7 @@ func (c *UIClient) printMessage(msg *pb.Message) {
 
 	// Format: [User]: Message
 	//         [LikeButton] Count
-	fmt.Fprintf(c.messageView, "[yellow]%s[white]: %s\n", userName, msg.Text)
+	fmt.Fprintf(c.messageView, "[\"user_%d\"][yellow]%s[\"\"][white]: %s\n", msg.UserId, userName, msg.Text)
 
 	// Create a region for the like button
 	regionID := fmt.Sprintf("like_%d", msg.Id)

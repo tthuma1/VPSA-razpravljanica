@@ -259,6 +259,19 @@ func (c *Client) GetMessages(ctx context.Context, topicName string, fromID int64
 	return resp.Messages, nil
 }
 
+func (c *Client) GetMessagesByUser(ctx context.Context, topicID int64, userName string, limit int32) ([]*pb.Message, error) {
+	resp, err := c.getReadClient().GetMessagesByUser(ctx, &pb.GetMessagesByUserRequest{
+		TopicId:       topicID,
+		UserName:      userName,
+		Limit:         limit,
+		RequestUserId: c.currentUser.Id,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp.Messages, nil
+}
+
 func (c *Client) GetUserById(ctx context.Context, id int64) (*pb.User, error) {
 	return c.getReadClient().GetUserById(ctx, &pb.GetUserByIdRequest{Id: id})
 }
