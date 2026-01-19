@@ -81,6 +81,7 @@ func (cp *ControlPlane) RegisterNode(_ context.Context, req *pb.RegisterNodeRequ
 	// Add to chain
 	cp.chain = append(cp.chain, nodeInfo)
 	cp.logReconfiguration()
+	cp.notifyAllNodes() // It would be better to only notify the tail, but this is easier to write.
 
 	return &emptypb.Empty{}, nil
 }
