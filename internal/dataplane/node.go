@@ -1,4 +1,3 @@
-// internal/dataplane/node.go
 package dataplane
 
 import (
@@ -357,8 +356,6 @@ func (n *Node) PostMessage(ctx context.Context, req *pb.PostMessageRequest) (*pb
 	n.broadcastEvent(event)
 
 	if n.nextNode != "" {
-		go n.notifyEvent(event)
-
 		errChan := make(chan error, 1)
 		n.pendingMu.Lock()
 		n.pendingWrites[seq] = errChan
@@ -423,8 +420,6 @@ func (n *Node) LikeMessage(ctx context.Context, req *pb.LikeMessageRequest) (*pb
 	n.broadcastEvent(event)
 
 	if n.nextNode != "" {
-		go n.notifyEvent(event)
-
 		errChan := make(chan error, 1)
 		n.pendingMu.Lock()
 		n.pendingWrites[seq] = errChan
@@ -597,8 +592,13 @@ func (n *Node) ReplicateWrite(_ context.Context, req *pb.ReplicationRequest) (*e
 		n.pendingMu.Unlock()
 	}
 
-	if err := n.applyWriteOp(op); err != nil {
+	event, err := n.applyWriteOp(op)
+	if err != nil {
 		return nil, err
+	}
+
+	if event != nil {
+		n.broadcastEvent(event)
 	}
 
 	// Forward to next node
@@ -616,10 +616,10 @@ func (n *Node) ReplicateWrite(_ context.Context, req *pb.ReplicationRequest) (*e
 	return &emptypb.Empty{}, nil
 }
 
-func (n *Node) applyWriteOp(op *pb.WriteOp) error {
+func (n *Node) applyWriteOp(op *pb.WriteOp) (*pb.MessageEvent, error) {
 	// Log the operation first (idempotent)
 	if _, err := n.storage.LogOperation(op); err != nil {
-		return err
+		return nil, err
 	}
 
 	switch o := op.Operation.(type) {
@@ -628,40 +628,43 @@ func (n *Node) applyWriteOp(op *pb.WriteOp) error {
 		if err != nil {
 			// If user already exists, it might be due to replay. Check if it exists.
 			if _, errGet := n.storage.GetUserByName(o.CreateUser.Name); errGet == nil {
-				return nil
+				return nil, nil
 			}
-			return err
+			return nil, err
 		}
 	case *pb.WriteOp_CreateTopic:
 		_, err := n.storage.CreateTopic(o.CreateTopic.Name)
 		if err != nil {
 			if _, errGet := n.storage.GetTopicByName(o.CreateTopic.Name); errGet == nil {
-				return nil
+				return nil, nil
 			}
-			return err
+			return nil, err
 		}
 	case *pb.WriteOp_PostMessage:
-		_, err := n.storage.PostMessage(o.PostMessage.TopicId, o.PostMessage.UserId, o.PostMessage.Text)
+		msg, err := n.storage.PostMessage(o.PostMessage.TopicId, o.PostMessage.UserId, o.PostMessage.Text)
 		if err != nil {
-			return err
+			return nil, err
 		}
+		return &pb.MessageEvent{
+			SequenceNumber: op.Sequence,
+			Op:             pb.OpType_OP_POST,
+			Message:        msg,
+			EventAt:        msg.CreatedAt,
+		}, nil
 	case *pb.WriteOp_LikeMessage:
-		_, err := n.storage.LikeMessage(o.LikeMessage.TopicId, o.LikeMessage.MessageId, o.LikeMessage.UserId)
+		msg, err := n.storage.LikeMessage(o.LikeMessage.TopicId, o.LikeMessage.MessageId, o.LikeMessage.UserId)
 		if err != nil {
-			return err
+			return nil, err
 		}
+		return &pb.MessageEvent{
+			SequenceNumber: op.Sequence,
+			Op:             pb.OpType_OP_LIKE,
+			Message:        msg,
+			EventAt:        timestamppb.Now(),
+			LikerId:        o.LikeMessage.UserId,
+		}, nil
 	}
-	return nil
-}
-
-func (n *Node) NotifyEvent(_ context.Context, event *pb.MessageEvent) (*emptypb.Empty, error) {
-	n.broadcastEvent(event)
-
-	if n.nextNode != "" && n.role != RoleTail {
-		go n.notifyEvent(event)
-	}
-
-	return &emptypb.Empty{}, nil
+	return nil, nil
 }
 
 func (n *Node) AcknowledgeWrite(_ context.Context, req *pb.AcknowledgeRequest) (*emptypb.Empty, error) {
@@ -803,24 +806,6 @@ func (n *Node) acknowledgeWrite(ctx context.Context, sequence int64) error {
 	}
 }
 
-func (n *Node) notifyEvent(event *pb.MessageEvent) {
-	if n.nextNode == "" {
-		return
-	}
-
-	conn, err := grpc.NewClient(n.nextNode, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-
-	client := pb.NewReplicationClient(conn)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	client.NotifyEvent(ctx, event)
-}
-
 func (n *Node) broadcastEvent(event *pb.MessageEvent) {
 	n.subMu.RLock()
 	defer n.subMu.RUnlock()
@@ -919,7 +904,8 @@ func (n *Node) SyncWithTail(ctx context.Context) error {
 		}
 		// Apply op
 		log.Printf("Applying %d, %s", op.Sequence, op.Operation)
-		if err := n.applyWriteOp(op); err != nil {
+		_, err = n.applyWriteOp(op)
+		if err != nil {
 			return fmt.Errorf("failed to apply op %d: %v", op.Sequence, err)
 		}
 
