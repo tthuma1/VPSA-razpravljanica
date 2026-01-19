@@ -682,9 +682,8 @@ func (n *Node) GetLastAcked(_ context.Context, _ *emptypb.Empty) (*pb.GetLastAck
 
 func (n *Node) runReplicationWorker() {
 	for op := range n.replQueue {
-		// Forward writes sequentially to preserve order
 		if err := n.replicateWrite(context.Background(), op); err != nil {
-			log.Printf("Failed to replicate write (seq %d): %v", op.Sequence, err)
+			log.Printf("Hard failed to replicate write (seq %d): %v", op.Sequence, err)
 		}
 	}
 }
@@ -692,7 +691,7 @@ func (n *Node) runReplicationWorker() {
 func (n *Node) runAckWorker() {
 	for seq := range n.ackQueue {
 		if err := n.acknowledgeWrite(context.Background(), seq); err != nil {
-			log.Printf("Failed to acknowledge write %d: %v", seq, err)
+			log.Printf("Hard failed to acknowledge write %d: %v", seq, err)
 		}
 	}
 }
