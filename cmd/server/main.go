@@ -17,7 +17,6 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 var (
@@ -120,11 +119,11 @@ func registerWithControlPlane(nodeID, address, controlAddr string, node *datapla
 
 		// Get and update role
 		if hasSynced {
-			_, err := updateRole(client, node)
-			if err != nil {
-				log.Printf("Failed to update role: %v", err)
-				return
-			}
+			//_, err := updateRole(client, node)
+			//if err != nil {
+			//	log.Printf("Failed to update role: %v", err)
+			//	return
+			//}
 		}
 
 		if !hasSynced {
@@ -138,13 +137,12 @@ func registerWithControlPlane(nodeID, address, controlAddr string, node *datapla
 			}
 			syncCancel()
 			hasSynced = true
-			log.Printf("Sync completed successfully")
 
-			_, err := updateRole(client, node)
-			if err != nil {
-				log.Printf("Failed to update role: %v", err)
-				return
-			}
+			//_, err := updateRole(client, node)
+			//if err != nil {
+			//	log.Printf("Failed to update role: %v", err)
+			//	return
+			//}
 		}
 	}
 
@@ -153,65 +151,4 @@ func registerWithControlPlane(nodeID, address, controlAddr string, node *datapla
 	for range ticker.C {
 		heartbeat()
 	}
-}
-
-func updateRole(client pb.ControlPlaneClient, node *dataplane.Node) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	state, err := client.GetClusterState(ctx, &emptypb.Empty{})
-	if err != nil {
-		return "", err
-	}
-
-	var prevNode string
-	var nextNode string
-	var role dataplane.NodeRole
-
-	// Determine role
-	if state.Head.NodeId == node.NodeID() {
-		chainState, err := client.GetChainState(ctx, &emptypb.Empty{})
-		if err != nil {
-			return "", err
-		}
-
-		if len(chainState.Chain) > 1 {
-			nextNode = chainState.Chain[1].Address
-		}
-		role = dataplane.RoleHead
-		prevNode = ""
-	} else if state.Tail.NodeId == node.NodeID() {
-		chainState, err := client.GetChainState(ctx, &emptypb.Empty{})
-		if err != nil {
-			return "", err
-		}
-
-		if len(chainState.Chain) > 1 {
-			prevNode = chainState.Chain[len(chainState.Chain)-2].Address
-		}
-		role = dataplane.RoleTail
-		nextNode = ""
-	} else {
-		// Find next node in chain
-		chainState, err := client.GetChainState(ctx, &emptypb.Empty{})
-		if err != nil {
-			return "", err
-		}
-
-		for i, n := range chainState.Chain {
-			if n.NodeId == node.NodeID() {
-				if i < len(chainState.Chain)-1 {
-					nextNode = chainState.Chain[i+1].Address
-				}
-				if i > 0 {
-					prevNode = chainState.Chain[i-1].Address
-				}
-				break
-			}
-		}
-		role = dataplane.RoleMiddle
-	}
-
-	node.SetRole(role, nextNode, prevNode)
-	return prevNode, nil
 }

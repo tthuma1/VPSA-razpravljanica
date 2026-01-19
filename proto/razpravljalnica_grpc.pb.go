@@ -22,6 +22,7 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
+	MessageBoard_NotifyStateChange_FullMethodName   = "/razpravljalnica.MessageBoard/NotifyStateChange"
 	MessageBoard_CreateUser_FullMethodName          = "/razpravljalnica.MessageBoard/CreateUser"
 	MessageBoard_Login_FullMethodName               = "/razpravljalnica.MessageBoard/Login"
 	MessageBoard_GetUser_FullMethodName             = "/razpravljalnica.MessageBoard/GetUser"
@@ -41,6 +42,7 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type MessageBoardClient interface {
+	NotifyStateChange(ctx context.Context, in *StateChangeNotification, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	CreateUser(ctx context.Context, in *CreateUserRequest, opts ...grpc.CallOption) (*User, error)
 	Login(ctx context.Context, in *LoginRequest, opts ...grpc.CallOption) (*User, error)
 	GetUser(ctx context.Context, in *GetUserRequest, opts ...grpc.CallOption) (*User, error)
@@ -62,6 +64,16 @@ type messageBoardClient struct {
 
 func NewMessageBoardClient(cc grpc.ClientConnInterface) MessageBoardClient {
 	return &messageBoardClient{cc}
+}
+
+func (c *messageBoardClient) NotifyStateChange(ctx context.Context, in *StateChangeNotification, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, MessageBoard_NotifyStateChange_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (c *messageBoardClient) CreateUser(ctx context.Context, in *CreateUserRequest, opts ...grpc.CallOption) (*User, error) {
@@ -207,6 +219,7 @@ type MessageBoard_SubscribeTopicClient = grpc.ServerStreamingClient[MessageEvent
 // All implementations must embed UnimplementedMessageBoardServer
 // for forward compatibility.
 type MessageBoardServer interface {
+	NotifyStateChange(context.Context, *StateChangeNotification) (*emptypb.Empty, error)
 	CreateUser(context.Context, *CreateUserRequest) (*User, error)
 	Login(context.Context, *LoginRequest) (*User, error)
 	GetUser(context.Context, *GetUserRequest) (*User, error)
@@ -230,6 +243,9 @@ type MessageBoardServer interface {
 // pointer dereference when methods are called.
 type UnimplementedMessageBoardServer struct{}
 
+func (UnimplementedMessageBoardServer) NotifyStateChange(context.Context, *StateChangeNotification) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method NotifyStateChange not implemented")
+}
 func (UnimplementedMessageBoardServer) CreateUser(context.Context, *CreateUserRequest) (*User, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateUser not implemented")
 }
@@ -288,6 +304,24 @@ func RegisterMessageBoardServer(s grpc.ServiceRegistrar, srv MessageBoardServer)
 		t.testEmbeddedByValue()
 	}
 	s.RegisterService(&MessageBoard_ServiceDesc, srv)
+}
+
+func _MessageBoard_NotifyStateChange_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StateChangeNotification)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MessageBoardServer).NotifyStateChange(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MessageBoard_NotifyStateChange_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MessageBoardServer).NotifyStateChange(ctx, req.(*StateChangeNotification))
+	}
+	return interceptor(ctx, in, info, handler)
 }
 
 func _MessageBoard_CreateUser_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -524,6 +558,10 @@ var MessageBoard_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "razpravljalnica.MessageBoard",
 	HandlerType: (*MessageBoardServer)(nil),
 	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "NotifyStateChange",
+			Handler:    _MessageBoard_NotifyStateChange_Handler,
+		},
 		{
 			MethodName: "CreateUser",
 			Handler:    _MessageBoard_CreateUser_Handler,

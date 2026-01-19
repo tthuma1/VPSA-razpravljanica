@@ -119,6 +119,26 @@ func (n *Node) checkSyncing() error {
 	return nil
 }
 
+func (n *Node) NotifyStateChange(_ context.Context, req *pb.StateChangeNotification) (*emptypb.Empty, error) {
+	log.Printf("Received state change: isHead=%v, isTail=%v", req.IsHead, req.IsTail)
+
+	prevNode := req.PrevNode
+	nextNode := req.NextNode
+	var role NodeRole
+
+	if req.IsHead {
+		role = RoleHead
+	} else if req.IsTail {
+		role = RoleTail
+	} else {
+		role = RoleMiddle
+	}
+
+	n.SetRole(role, nextNode, prevNode)
+
+	return &emptypb.Empty{}, nil
+}
+
 // Write operations (Head only)
 func (n *Node) CreateUser(ctx context.Context, req *pb.CreateUserRequest) (*pb.User, error) {
 	if err := n.checkSyncing(); err != nil {
@@ -491,7 +511,7 @@ func (n *Node) GetMessagesByUser(ctx context.Context, req *pb.GetMessagesByUserR
 }
 
 // Subscription handling
-func (n *Node) GetSubscriptionNode(ctx context.Context, req *pb.SubscriptionNodeRequest) (*pb.SubscriptionNodeResponse, error) {
+func (n *Node) GetSubscriptionNode(_ context.Context, _ *pb.SubscriptionNodeRequest) (*pb.SubscriptionNodeResponse, error) {
 	if err := n.checkSyncing(); err != nil {
 		return nil, err
 	}
@@ -565,7 +585,7 @@ func (n *Node) SubscribeTopic(req *pb.SubscribeTopicRequest, stream pb.MessageBo
 }
 
 // Replication
-func (n *Node) ReplicateWrite(ctx context.Context, req *pb.ReplicationRequest) (*emptypb.Empty, error) {
+func (n *Node) ReplicateWrite(_ context.Context, req *pb.ReplicationRequest) (*emptypb.Empty, error) {
 	op := req.Op
 
 	// Mark as unacknowledged before processing
@@ -634,7 +654,7 @@ func (n *Node) applyWriteOp(op *pb.WriteOp) error {
 	return nil
 }
 
-func (n *Node) NotifyEvent(ctx context.Context, event *pb.MessageEvent) (*emptypb.Empty, error) {
+func (n *Node) NotifyEvent(_ context.Context, event *pb.MessageEvent) (*emptypb.Empty, error) {
 	n.broadcastEvent(event)
 
 	if n.nextNode != "" && n.role != RoleTail {
@@ -644,7 +664,7 @@ func (n *Node) NotifyEvent(ctx context.Context, event *pb.MessageEvent) (*emptyp
 	return &emptypb.Empty{}, nil
 }
 
-func (n *Node) AcknowledgeWrite(ctx context.Context, req *pb.AcknowledgeRequest) (*emptypb.Empty, error) {
+func (n *Node) AcknowledgeWrite(_ context.Context, req *pb.AcknowledgeRequest) (*emptypb.Empty, error) {
 	// Persist acknowledgement
 	if err := n.storage.UpdateLastAcked(req.Sequence); err != nil {
 		log.Printf("Failed to persist acknowledgement for seq %d: %v", req.Sequence, err)
@@ -666,7 +686,7 @@ func (n *Node) AcknowledgeWrite(ctx context.Context, req *pb.AcknowledgeRequest)
 	return &emptypb.Empty{}, nil
 }
 
-func (n *Node) GetLastAcked(ctx context.Context, _ *emptypb.Empty) (*pb.GetLastAckedResponse, error) {
+func (n *Node) GetLastAcked(_ context.Context, _ *emptypb.Empty) (*pb.GetLastAckedResponse, error) {
 	seq, err := n.storage.GetLastAcked()
 	if err != nil {
 		return nil, err

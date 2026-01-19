@@ -56,6 +56,8 @@ message NodeInfo {
 ////////////////////////////////////////////////////////////////////////////////
 
 service MessageBoard {
+  rpc NotifyStateChange(StateChangeNotification) returns (google.protobuf.Empty);
+
   rpc CreateUser(CreateUserRequest) returns (User);
   rpc Login(LoginRequest) returns (User);
   rpc GetUser(GetUserRequest) returns (User);
@@ -156,6 +158,13 @@ message MessageEvent {
   Message message = 3;
   google.protobuf.Timestamp event_at = 4;
   int64 liker_id = 5;
+}
+
+message StateChangeNotification {
+  string prevNode = 1;
+  string nextNode = 2;
+  bool is_head = 3;
+  bool is_tail = 4;
 }
 
 ////////////////////////////////////////////////////////////////////////////////

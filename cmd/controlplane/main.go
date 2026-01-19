@@ -3,6 +3,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -22,7 +23,7 @@ var (
 func main() {
 	flag.Parse()
 
-	address := "localhost:50050"
+	address := fmt.Sprintf("localhost:%d", *port)
 
 	// Create control plane
 	cp := controlplane.NewControlPlane()
@@ -44,7 +45,7 @@ func main() {
 		}
 	}()
 
-	// Wait for interrupt
+	// When we send SIGTERM, control plane gracefully shuts down
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	<-sigCh
