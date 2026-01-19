@@ -455,32 +455,6 @@ func (s *Storage) GetMessagesByUser(topicID int64, userName string, limit int32,
 	return messages, rows.Err()
 }
 
-func (s *Storage) rowsToMessages(rows *sql.Rows, requestUserID int64) ([]*pb.Message, error) {
-	var messages []*pb.Message
-	for rows.Next() {
-		var msg pb.Message
-		var createdAt int64
-		if err := rows.Scan(&msg.Id, &msg.TopicId, &msg.UserId, &msg.Text, &createdAt, &msg.Likes); err != nil {
-			return nil, err
-		}
-		msg.CreatedAt = timestamppb.New(time.Unix(createdAt, 0))
-
-		// Check if liked by user
-		if requestUserID != 0 {
-			var liked int
-			err := s.db.QueryRow("SELECT COUNT(*) FROM likes WHERE message_id = ? AND user_id = ?", msg.Id, requestUserID).Scan(&liked)
-			if err != nil {
-				return nil, err
-			}
-			msg.IsLiked = liked > 0
-		}
-
-		messages = append(messages, &msg)
-	}
-
-	return messages, rows.Err()
-}
-
 func (s *Storage) NextSequence() int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
