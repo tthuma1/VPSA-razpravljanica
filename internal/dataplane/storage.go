@@ -107,7 +107,7 @@ func (s *Storage) CreateUser(name, password, salt string) (*pb.User, error) {
 		return nil, fmt.Errorf("user with name '%s' already exists", name)
 	}
 
-	// If salt is not provided (e.g. from client), generate it
+	// If salt is not provided, generate it
 	if salt == "" {
 		salt, err = generateSalt()
 		if err != nil {
@@ -383,29 +383,7 @@ func (s *Storage) GetMessages(topicID, fromMessageID int64, limit int32, request
 	}
 	defer rows.Close()
 
-	var messages []*pb.Message
-	for rows.Next() {
-		var msg pb.Message
-		var createdAt int64
-		if err := rows.Scan(&msg.Id, &msg.TopicId, &msg.UserId, &msg.Text, &createdAt, &msg.Likes); err != nil {
-			return nil, err
-		}
-		msg.CreatedAt = timestamppb.New(time.Unix(createdAt, 0))
-
-		// Check if liked by user
-		if requestUserID != 0 {
-			var liked int
-			err = s.db.QueryRow("SELECT COUNT(*) FROM likes WHERE message_id = ? AND user_id = ?", msg.Id, requestUserID).Scan(&liked)
-			if err != nil {
-				return nil, err
-			}
-			msg.IsLiked = liked > 0
-		}
-
-		messages = append(messages, &msg)
-	}
-
-	return messages, rows.Err()
+	return s.rowsToMessages(rows, requestUserID)
 }
 
 func (s *Storage) GetMessagesByUser(topicID int64, userName string, limit int32, requestUserID int64) ([]*pb.Message, error) {
@@ -430,6 +408,10 @@ func (s *Storage) GetMessagesByUser(topicID int64, userName string, limit int32,
 	}
 	defer rows.Close()
 
+	return s.rowsToMessages(rows, requestUserID)
+}
+
+func (s *Storage) rowsToMessages(rows *sql.Rows, requestUserID int64) ([]*pb.Message, error) {
 	var messages []*pb.Message
 	for rows.Next() {
 		var msg pb.Message
@@ -442,7 +424,7 @@ func (s *Storage) GetMessagesByUser(topicID int64, userName string, limit int32,
 		// Check if liked by user
 		if requestUserID != 0 {
 			var liked int
-			err = s.db.QueryRow("SELECT COUNT(*) FROM likes WHERE message_id = ? AND user_id = ?", msg.Id, requestUserID).Scan(&liked)
+			err := s.db.QueryRow("SELECT COUNT(*) FROM likes WHERE message_id = ? AND user_id = ?", msg.Id, requestUserID).Scan(&liked)
 			if err != nil {
 				return nil, err
 			}

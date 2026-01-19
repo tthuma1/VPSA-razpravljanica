@@ -42,16 +42,8 @@ type Node struct {
 	// Subscription management
 	subscriptions map[string]*Subscription
 	subMu         sync.RWMutex
-	subCounter    int
 
-	// Event broadcast
-	eventListeners []chan *pb.MessageEvent
-	eventMu        sync.RWMutex
-
-	// Pending writes (Head only) and Unacknowledged writes (All nodes except Tail)
-	// Map sequence number to:
-	// - Head: channel for waiting client
-	// - Middle: nil (just tracking existence for read consistency)
+	// This map is used so that Head waits for ACK before sending a response to the client.
 	pendingWrites map[int64]chan error
 	pendingMu     sync.RWMutex
 
@@ -119,7 +111,7 @@ func (n *Node) checkSyncing() error {
 }
 
 func (n *Node) NotifyStateChange(_ context.Context, req *pb.StateChangeNotification) (*emptypb.Empty, error) {
-	log.Printf("Received state change: isHead=%v, isTail=%v", req.IsHead, req.IsTail)
+	log.Printf("Received state change: prevNode=%s, nextNode=%s, isHead=%v, isTail=%v", req.PrevNode, req.NextNode, req.IsHead, req.IsTail)
 
 	prevNode := req.PrevNode
 	nextNode := req.NextNode
@@ -582,16 +574,6 @@ func (n *Node) SubscribeTopic(req *pb.SubscribeTopicRequest, stream pb.MessageBo
 // Replication
 func (n *Node) ReplicateWrite(_ context.Context, req *pb.ReplicationRequest) (*emptypb.Empty, error) {
 	op := req.Op
-
-	// Mark as unacknowledged before processing
-	if n.role != RoleTail {
-		n.pendingMu.Lock()
-		if _, exists := n.pendingWrites[op.Sequence]; !exists {
-			n.pendingWrites[op.Sequence] = nil
-		}
-		n.pendingMu.Unlock()
-	}
-
 	event, err := n.applyWriteOp(op)
 	if err != nil {
 		return nil, err
@@ -680,6 +662,7 @@ func (n *Node) AcknowledgeWrite(_ context.Context, req *pb.AcknowledgeRequest) (
 
 	if n.role == RoleHead {
 		if exists && ch != nil {
+			// Make this node send a successful response to the client
 			ch <- nil
 		}
 	} else {
