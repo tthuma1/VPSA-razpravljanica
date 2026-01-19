@@ -175,6 +175,10 @@ func (c *UIClient) setupUI() {
 			c.showCreateTopicForm()
 		}), 3, 0, false).
 		AddItem(nil, 1, 0, false).
+		AddItem(tview.NewButton("Join Group").SetSelectedFunc(func() {
+			c.showJoinTopicList()
+		}), 3, 0, false).
+		AddItem(nil, 1, 0, false).
 		AddItem(tview.NewButton("Refresh").SetSelectedFunc(func() {
 			c.refreshTopics()
 			if c.currentTopic != "" {
@@ -261,6 +265,60 @@ func (c *UIClient) showCreateTopicForm() {
 	form.SetBorder(true).SetTitle("Create Topic")
 
 	c.pages.AddPage("create_topic_form", c.center(form, 40, 10), true, true)
+}
+
+func (c *UIClient) showJoinTopicList() {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		topics, err := c.ListJoinableTopics(ctx)
+		if err != nil {
+			c.showError(fmt.Sprintf("Error listing joinable topics: %v", err))
+			return
+		}
+
+		c.app.QueueUpdateDraw(func() {
+			list := tview.NewList().ShowSecondaryText(false)
+			list.SetBorder(true).SetTitle("Join Group")
+
+			for _, topic := range topics {
+				// Capture topic ID for closure
+				tID := topic.Id
+				tName := topic.Name
+				list.AddItem(tName, "", 0, func() {
+					c.pages.RemovePage("join_topic_list")
+					go func() {
+						c.joinTopic(tID, tName)
+						time.Sleep(500 * time.Millisecond)
+						c.app.QueueUpdateDraw(func() {
+							c.refreshTopics()
+						})
+					}()
+				})
+			}
+
+			list.AddItem("Cancel", "", 'c', func() {
+				c.pages.RemovePage("join_topic_list")
+			})
+
+			c.pages.AddPage("join_topic_list", c.center(list, 40, 20), true, true)
+		})
+	}()
+}
+
+func (c *UIClient) joinTopic(topicID int64, topicName string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := c.JoinTopic(ctx, topicID)
+	if err != nil {
+		c.showError(status.Convert(err).Message())
+	} else {
+		c.app.QueueUpdateDraw(func() {
+			c.statusLine.SetText(fmt.Sprintf("Joined topic: %s", topicName))
+		})
+	}
 }
 
 func (c *UIClient) refreshTopics() {

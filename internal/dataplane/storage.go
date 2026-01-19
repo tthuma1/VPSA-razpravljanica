@@ -75,6 +75,14 @@ func (s *Storage) initSchema() error {
 		FOREIGN KEY (user_id) REFERENCES users(id)
 	);
 
+	CREATE TABLE IF NOT EXISTS topic_participants (
+		topic_id INTEGER NOT NULL,
+		user_id INTEGER NOT NULL,
+		PRIMARY KEY (topic_id, user_id),
+		FOREIGN KEY (topic_id) REFERENCES topics(id),
+		FOREIGN KEY (user_id) REFERENCES users(id)
+	);
+
 	CREATE TABLE IF NOT EXISTS sequence (
 		id INTEGER PRIMARY KEY CHECK (id = 1),
 		last_seq INTEGER DEFAULT 0,
@@ -91,6 +99,49 @@ func (s *Storage) initSchema() error {
 
 	_, err := s.db.Exec(schema)
 	return err
+}
+
+func (s *Storage) AddTopicParticipant(topicID, userID int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec("INSERT OR IGNORE INTO topic_participants (topic_id, user_id) VALUES (?, ?)", topicID, userID)
+	return err
+}
+
+func (s *Storage) RemoveTopicParticipant(topicID, userID int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec("DELETE FROM topic_participants WHERE topic_id = ? AND user_id = ?", topicID, userID)
+	return err
+}
+
+func (s *Storage) GetTopicParticipants(topicID int64) ([]*pb.User, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rows, err := s.db.Query(`
+		SELECT u.id, u.name, u.password_hash, u.salt 
+		FROM users u
+		JOIN topic_participants tp ON u.id = tp.user_id
+		WHERE tp.topic_id = ?
+	`, topicID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var users []*pb.User
+	for rows.Next() {
+		var u pb.User
+		if err := rows.Scan(&u.Id, &u.Name, &u.PasswordHash, &u.Salt); err != nil {
+			return nil, err
+		}
+		users = append(users, &u)
+	}
+
+	return users, rows.Err()
 }
 
 func (s *Storage) CreateUser(name, password, salt string) (*pb.User, error) {
@@ -188,7 +239,7 @@ func (s *Storage) GetUserById(id int64) (*pb.User, error) {
 	return &user, nil
 }
 
-func (s *Storage) CreateTopic(name string) (*pb.Topic, error) {
+func (s *Storage) CreateTopic(name string, userID int64) (*pb.Topic, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -210,6 +261,14 @@ func (s *Storage) CreateTopic(name string) (*pb.Topic, error) {
 	id, err := result.LastInsertId()
 	if err != nil {
 		return nil, err
+	}
+
+	// Add creator as participant
+	if userID != 0 {
+		_, err = s.db.Exec("INSERT INTO topic_participants (topic_id, user_id) VALUES (?, ?)", id, userID)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return &pb.Topic{Id: id, Name: name}, nil
@@ -348,11 +407,77 @@ func (s *Storage) GetMessage(messageID int64, userID int64) (*pb.Message, error)
 	return &msg, nil
 }
 
-func (s *Storage) ListTopics() ([]*pb.Topic, error) {
+func (s *Storage) ListTopics(userID int64) ([]*pb.Topic, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var rows *sql.Rows
+	var err error
+
+	if userID == 0 {
+		// Return empty list if no user ID provided, to enforce filtering
+		return []*pb.Topic{}, nil
+	} else {
+		rows, err = s.db.Query(`
+			SELECT t.id, t.name 
+			FROM topics t
+			JOIN topic_participants tp ON t.id = tp.topic_id
+			WHERE tp.user_id = ?
+			ORDER BY t.id
+		`, userID)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var topics []*pb.Topic
+	for rows.Next() {
+		var t pb.Topic
+		if err := rows.Scan(&t.Id, &t.Name); err != nil {
+			return nil, err
+		}
+		topics = append(topics, &t)
+	}
+
+	return topics, rows.Err()
+}
+
+func (s *Storage) ListAllTopics() ([]*pb.Topic, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	rows, err := s.db.Query("SELECT id, name FROM topics ORDER BY id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var topics []*pb.Topic
+	for rows.Next() {
+		var t pb.Topic
+		if err := rows.Scan(&t.Id, &t.Name); err != nil {
+			return nil, err
+		}
+		topics = append(topics, &t)
+	}
+
+	return topics, rows.Err()
+}
+
+func (s *Storage) ListJoinableTopics(userID int64) ([]*pb.Topic, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rows, err := s.db.Query(`
+		SELECT t.id, t.name 
+		FROM topics t
+		WHERE t.id NOT IN (
+			SELECT topic_id FROM topic_participants WHERE user_id = ?
+		)
+		ORDER BY t.id
+	`, userID)
 	if err != nil {
 		return nil, err
 	}

@@ -240,7 +240,7 @@ func (n *Node) CreateTopic(ctx context.Context, req *pb.CreateTopicRequest) (*pb
 		return nil, fmt.Errorf("not the head node")
 	}
 
-	topic, err := n.storage.CreateTopic(req.Name)
+	topic, err := n.storage.CreateTopic(req.Name, req.UserId)
 	if err != nil {
 		return nil, err
 	}
@@ -438,17 +438,105 @@ func (n *Node) LikeMessage(ctx context.Context, req *pb.LikeMessageRequest) (*pb
 	return msg, nil
 }
 
+func (n *Node) JoinTopic(ctx context.Context, req *pb.JoinTopicRequest) (*emptypb.Empty, error) {
+	if err := n.checkSyncing(); err != nil {
+		return nil, err
+	}
+	if n.role != RoleHead {
+		return nil, fmt.Errorf("not the head node")
+	}
+
+	err := n.storage.AddTopicParticipant(req.TopicId, req.UserId)
+	if err != nil {
+		return nil, err
+	}
+
+	if n.nextNode != "" {
+		seq, err := n.storage.LogOperation(&pb.WriteOp{
+			Operation: &pb.WriteOp_JoinTopic{JoinTopic: req},
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		errChan := make(chan error, 1)
+		n.pendingMu.Lock()
+		n.pendingWrites[seq] = errChan
+		n.pendingMu.Unlock()
+
+		err = n.replicateWrite(ctx, &pb.WriteOp{
+			Operation: &pb.WriteOp_JoinTopic{JoinTopic: req},
+			Sequence:  seq,
+		})
+		if err != nil {
+			n.pendingMu.Lock()
+			delete(n.pendingWrites, seq)
+			n.pendingMu.Unlock()
+			return nil, err
+		}
+
+		// Wait for acknowledgement
+		select {
+		case err := <-errChan:
+			if err != nil {
+				return nil, err
+			}
+		case <-ctx.Done():
+			n.pendingMu.Lock()
+			delete(n.pendingWrites, seq)
+			n.pendingMu.Unlock()
+			return nil, ctx.Err()
+		}
+	}
+
+	return &emptypb.Empty{}, nil
+}
+
 // Read operations
-func (n *Node) ListTopics(ctx context.Context, _ *emptypb.Empty) (*pb.ListTopicsResponse, error) {
+func (n *Node) ListTopics(ctx context.Context, req *pb.ListTopicsRequest) (*pb.ListTopicsResponse, error) {
 	if err := n.checkSyncing(); err != nil {
 		return nil, err
 	}
 	// Check if we have unacknowledged writes. If so, forward to tail.
 	if n.role != RoleTail && n.hasPendingWrites() {
-		return n.forwardListTopicsToTail(ctx)
+		return n.forwardListTopicsToTail(ctx, req)
 	}
 
-	topics, err := n.storage.ListTopics()
+	topics, err := n.storage.ListTopics(req.UserId)
+	if err != nil {
+		return nil, err
+	}
+
+	return &pb.ListTopicsResponse{Topics: topics}, nil
+}
+
+func (n *Node) ListAllTopics(ctx context.Context, _ *emptypb.Empty) (*pb.ListTopicsResponse, error) {
+	if err := n.checkSyncing(); err != nil {
+		return nil, err
+	}
+	// Check if we have unacknowledged writes. If so, forward to tail.
+	if n.role != RoleTail && n.hasPendingWrites() {
+		return n.forwardListAllTopicsToTail(ctx)
+	}
+
+	topics, err := n.storage.ListAllTopics()
+	if err != nil {
+		return nil, err
+	}
+
+	return &pb.ListTopicsResponse{Topics: topics}, nil
+}
+
+func (n *Node) ListJoinableTopics(ctx context.Context, req *pb.ListJoinableTopicsRequest) (*pb.ListTopicsResponse, error) {
+	if err := n.checkSyncing(); err != nil {
+		return nil, err
+	}
+	// Check if we have unacknowledged writes. If so, forward to tail.
+	if n.role != RoleTail && n.hasPendingWrites() {
+		return n.forwardListJoinableTopicsToTail(ctx, req)
+	}
+
+	topics, err := n.storage.ListJoinableTopics(req.UserId)
 	if err != nil {
 		return nil, err
 	}
@@ -613,7 +701,7 @@ func (n *Node) applyWriteOp(op *pb.WriteOp) error {
 			return err
 		}
 	case *pb.WriteOp_CreateTopic:
-		_, err := n.storage.CreateTopic(o.CreateTopic.Name)
+		_, err := n.storage.CreateTopic(o.CreateTopic.Name, o.CreateTopic.UserId)
 		if err != nil {
 			if _, errGet := n.storage.GetTopicByName(o.CreateTopic.Name); errGet == nil {
 				return nil
@@ -627,6 +715,11 @@ func (n *Node) applyWriteOp(op *pb.WriteOp) error {
 		}
 	case *pb.WriteOp_LikeMessage:
 		_, err := n.storage.LikeMessage(o.LikeMessage.TopicId, o.LikeMessage.MessageId, o.LikeMessage.UserId)
+		if err != nil {
+			return err
+		}
+	case *pb.WriteOp_JoinTopic:
+		err := n.storage.AddTopicParticipant(o.JoinTopic.TopicId, o.JoinTopic.UserId)
 		if err != nil {
 			return err
 		}
@@ -962,13 +1055,31 @@ func (n *Node) forwardGetTopicToTail(ctx context.Context, req *pb.GetTopicReques
 	return client.GetTopic(ctx, req)
 }
 
-func (n *Node) forwardListTopicsToTail(ctx context.Context) (*pb.ListTopicsResponse, error) {
+func (n *Node) forwardListTopicsToTail(ctx context.Context, req *pb.ListTopicsRequest) (*pb.ListTopicsResponse, error) {
 	client, conn, err := n.getTailClient()
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
-	return client.ListTopics(ctx, &emptypb.Empty{})
+	return client.ListTopics(ctx, req)
+}
+
+func (n *Node) forwardListAllTopicsToTail(ctx context.Context) (*pb.ListTopicsResponse, error) {
+	client, conn, err := n.getTailClient()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	return client.ListAllTopics(ctx, &emptypb.Empty{})
+}
+
+func (n *Node) forwardListJoinableTopicsToTail(ctx context.Context, req *pb.ListJoinableTopicsRequest) (*pb.ListTopicsResponse, error) {
+	client, conn, err := n.getTailClient()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	return client.ListJoinableTopics(ctx, req)
 }
 
 func (n *Node) forwardGetMessagesToTail(ctx context.Context, req *pb.GetMessagesRequest) (*pb.GetMessagesResponse, error) {
