@@ -135,6 +135,7 @@ func parseLeaderRedirect(err error) string {
 }
 
 func (c *Client) getReadClient() pb.MessageBoardClient {
+	// round-robin for reading. Forwards reads to write if there are unacked operation at reaedClient.
 	if len(c.readClients) == 0 {
 		return c.headClient
 	}

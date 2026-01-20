@@ -9,6 +9,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	pb "messageboard/proto"
@@ -60,6 +61,9 @@ type Node struct {
 
 	// Ack queue ensures acknowledgements are forwarded in order
 	ackQueue chan int64
+
+	// Round robin index for subscription load balancing
+	rrIndex uint64
 }
 
 type Subscription struct {
@@ -713,7 +717,7 @@ func (n *Node) GetMessagesByUser(ctx context.Context, req *pb.GetMessagesByUserR
 }
 
 // Subscription handling
-func (n *Node) GetSubscriptionNode(_ context.Context, _ *pb.SubscriptionNodeRequest) (*pb.SubscriptionNodeResponse, error) {
+func (n *Node) GetSubscriptionNode(ctx context.Context, _ *pb.SubscriptionNodeRequest) (*pb.SubscriptionNodeResponse, error) {
 	if err := n.checkSyncing(); err != nil {
 		return nil, err
 	}
@@ -721,15 +725,33 @@ func (n *Node) GetSubscriptionNode(_ context.Context, _ *pb.SubscriptionNodeRequ
 		return nil, fmt.Errorf("not the head node")
 	}
 
+	n.cpClientMu.RLock()
+	cpClient := n.cpClient
+	n.cpClientMu.RUnlock()
+
+	if cpClient == nil {
+		return nil, fmt.Errorf("control plane client not set")
+	}
+
+	chainState, err := cpClient.GetChainState(ctx, &emptypb.Empty{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get chain state: %v", err)
+	}
+
+	chain := chainState.Chain
+	if len(chain) == 0 {
+		return nil, fmt.Errorf("chain is empty")
+	}
+
+	// Simple round-robin load balancing
+	idx := atomic.AddUint64(&n.rrIndex, 1)
+	selectedNode := chain[idx%uint64(len(chain))]
+
 	token := generateToken()
 
-	// TODO: Simple round-robin load balancing - assign to self for now
 	return &pb.SubscriptionNodeResponse{
 		SubscribeToken: token,
-		Node: &pb.NodeInfo{
-			NodeId:  n.nodeID,
-			Address: n.address,
-		},
+		Node:           selectedNode,
 	}, nil
 }
 
@@ -758,6 +780,7 @@ func (n *Node) SubscribeTopic(req *pb.SubscribeTopicRequest, stream pb.MessageBo
 
 	// Send historical messages
 	for _, topicID := range sub.TopicIDs {
+		log.Printf("Subscribing on topic id %d", topicID)
 		messages, err := n.storage.GetMessages(topicID, sub.FromMessageID, 1000, req.UserId)
 		if err != nil {
 			continue
