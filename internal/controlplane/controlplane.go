@@ -6,33 +6,41 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"net" // Added for TCP dial
+	"net"
 	"sync"
 	"time"
 
 	pb "messageboard/proto"
 
 	"github.com/hashicorp/raft"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
+
+// This map defines the static list of peers in the Raft cluster.
+var raftPeers = map[string]string{
+	"node1": "localhost:60051",
+	"node2": "localhost:60052",
+	"node3": "localhost:60053",
+}
 
 type ControlPlane struct {
 	pb.UnimplementedControlPlaneServer
 
-	mu             sync.RWMutex
-	nodes          map[string]*NodeState
-	chain          []*pb.NodeInfo
-	lastHeartbeats map[string]time.Time
+	mu               sync.RWMutex
+	nodes            map[string]*NodeState
+	chain            []*pb.NodeInfo
+	lastHeartbeats   map[string]time.Time
+	heartbeatTimeout time.Duration
 
 	nodeClients map[string]pb.MessageBoardClient
 	nodeConns   map[string]*grpc.ClientConn
 
-	raft *raft.Raft
+	raft         *raft.Raft
+	leadershipCh chan bool
 }
 
 type NodeState struct {
@@ -43,15 +51,156 @@ type NodeState struct {
 
 func NewControlPlane() *ControlPlane {
 	cp := &ControlPlane{
-		nodes:          make(map[string]*NodeState),
-		chain:          make([]*pb.NodeInfo, 0),
-		lastHeartbeats: make(map[string]time.Time),
-		nodeClients:    make(map[string]pb.MessageBoardClient),
-		nodeConns:      make(map[string]*grpc.ClientConn),
+		nodes:            make(map[string]*NodeState),
+		chain:            make([]*pb.NodeInfo, 0),
+		lastHeartbeats:   make(map[string]time.Time),
+		heartbeatTimeout: 15 * time.Second,
+		nodeClients:      make(map[string]pb.MessageBoardClient),
+		nodeConns:        make(map[string]*grpc.ClientConn),
+		leadershipCh:     make(chan bool, 1),
 	}
 
-	go cp.monitorHealth()
+	go cp.monitorDataPlaneHealth()
+	go cp.leaderReconciliationLoop()
+
 	return cp
+}
+
+func (cp *ControlPlane) leaderReconciliationLoop() {
+	for isLeader := range cp.leadershipCh {
+		if isLeader {
+			log.Println("Assumed leadership. Starting Raft peer reconciliation.")
+			ticker := time.NewTicker(10 * time.Second)
+			defer ticker.Stop()
+
+		Outer:
+			for {
+				cp.reconcileRaftPeers()
+				select {
+				case <-ticker.C:
+					cp.reconcileRaftPeers()
+				case isLeader := <-cp.leadershipCh:
+					if !isLeader {
+						log.Println("Lost leadership. Stopping Raft peer reconciliation.")
+						break Outer
+					}
+				}
+			}
+		}
+	}
+}
+
+func (cp *ControlPlane) reconcileRaftPeers() {
+	if cp.raft == nil || cp.raft.State() != raft.Leader {
+		return
+	}
+
+	configFuture := cp.raft.GetConfiguration()
+	if err := configFuture.Error(); err != nil {
+		log.Printf("Error getting Raft configuration for reconciliation: %v", err)
+		return
+	}
+	config := configFuture.Configuration()
+	currentServers := make(map[raft.ServerID]bool)
+	for _, srv := range config.Servers {
+		currentServers[srv.ID] = true
+	}
+
+	// Add missing peers
+	for id, addr := range raftPeers {
+		serverID := raft.ServerID(id)
+		if _, exists := currentServers[serverID]; !exists {
+			log.Printf("Reconciliation: Peer %s is missing from Raft config. Attempting to add.", id)
+			conn, err := net.DialTimeout("tcp", addr, 1*time.Second)
+			if err != nil {
+				log.Printf("Reconciliation: Peer %s at %s is not reachable, skipping add: %v", id, addr, err)
+				continue
+			}
+			conn.Close()
+
+			addFuture := cp.raft.AddVoter(serverID, raft.ServerAddress(addr), 0, 0)
+			if err := addFuture.Error(); err != nil {
+				log.Printf("Reconciliation: Error adding peer %s: %v", id, err)
+			} else {
+				log.Printf("Reconciliation: Successfully added peer %s to the cluster.", id)
+			}
+		}
+	}
+
+	// Remove extra peers
+	for _, srv := range config.Servers {
+		if _, exists := raftPeers[string(srv.ID)]; !exists {
+			log.Printf("Reconciliation: Peer %s is in Raft config but not in static peer list. Attempting to remove.", srv.ID)
+			removeFuture := cp.raft.RemoveServer(srv.ID, 0, 0)
+			if err := removeFuture.Error(); err != nil {
+				log.Printf("Reconciliation: Error removing peer %s: %v", srv.ID, err)
+			} else {
+				log.Printf("Reconciliation: Successfully removed peer %s from the cluster.", srv.ID)
+			}
+		}
+	}
+}
+
+func (cp *ControlPlane) monitorDataPlaneHealth() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		if cp.raft != nil && cp.raft.State() == raft.Leader {
+			cp.checkDataPlaneNodeHealth()
+		}
+	}
+}
+
+func (cp *ControlPlane) checkDataPlaneNodeHealth() {
+	cp.mu.RLock()
+	var unhealthyNodes []string
+	now := time.Now()
+	for nodeID, lastHB := range cp.lastHeartbeats {
+		if now.Sub(lastHB) > cp.heartbeatTimeout {
+			if state, exists := cp.nodes[nodeID]; exists && state.Healthy {
+				log.Printf("Leader detected data plane node %s as unhealthy.", nodeID)
+				unhealthyNodes = append(unhealthyNodes, nodeID)
+			}
+		}
+	}
+	cp.mu.RUnlock()
+
+	if len(unhealthyNodes) > 0 {
+		cp.removeDataPlaneNodes(unhealthyNodes)
+	}
+}
+
+func (cp *ControlPlane) removeDataPlaneNodes(nodeIDs []string) {
+	var removalApplied bool
+	for _, nodeID := range nodeIDs {
+		cmdData, err := json.Marshal(nodeID)
+		if err != nil {
+			log.Printf("Error marshalling remove command data for %s: %v", nodeID, err)
+			continue
+		}
+		cmd := &Command{Op: "remove", Data: cmdData}
+		cmdBytes, err := json.Marshal(cmd)
+		if err != nil {
+			log.Printf("Error marshalling remove command for %s: %v", nodeID, err)
+			continue
+		}
+
+		log.Printf("Leader proposing removal of data plane node %s", nodeID)
+		f := cp.raft.Apply(cmdBytes, 500*time.Millisecond)
+		if err := f.Error(); err != nil {
+			log.Printf("Failed to apply removal for data plane node %s: %v", nodeID, err)
+		} else {
+			removalApplied = true
+		}
+	}
+
+	if removalApplied {
+		time.Sleep(250 * time.Millisecond)
+		cp.mu.RLock()
+		defer cp.mu.RUnlock()
+		cp.notifyAllNodes()
+	}
 }
 
 func (cp *ControlPlane) GetLeader(
@@ -101,7 +250,6 @@ func (cp *ControlPlane) RegisterNode(_ context.Context, req *pb.RegisterNodeRequ
 		return nil, fmt.Errorf("raft apply failed: %v", err)
 	}
 
-	// After applying, the leader is responsible for notifying nodes.
 	cp.mu.RLock()
 	defer cp.mu.RUnlock()
 	cp.notifyAllNodes()
@@ -110,7 +258,6 @@ func (cp *ControlPlane) RegisterNode(_ context.Context, req *pb.RegisterNodeRequ
 }
 
 func (cp *ControlPlane) applyRegisterNode(nodeInfo *pb.NodeInfo) {
-	// This function is now idempotent.
 	cp.lastHeartbeats[nodeInfo.NodeId] = time.Now()
 
 	if state, exists := cp.nodes[nodeInfo.NodeId]; exists {
@@ -118,7 +265,6 @@ func (cp *ControlPlane) applyRegisterNode(nodeInfo *pb.NodeInfo) {
 		state.Info = nodeInfo
 		state.Healthy = true
 
-		// Re-establish gRPC client in case the connection was dropped or address changed
 		if oldConn, connExists := cp.nodeConns[nodeInfo.NodeId]; connExists {
 			_ = oldConn.Close()
 		}
@@ -130,7 +276,6 @@ func (cp *ControlPlane) applyRegisterNode(nodeInfo *pb.NodeInfo) {
 		cp.nodeClients[nodeInfo.NodeId] = pb.NewMessageBoardClient(conn)
 		cp.nodeConns[nodeInfo.NodeId] = conn
 
-		// Update the chain info as well
 		for i, n := range cp.chain {
 			if n.NodeId == nodeInfo.NodeId {
 				cp.chain[i] = nodeInfo
@@ -225,122 +370,6 @@ func (cp *ControlPlane) applyConfirmSynced(nodeID string) {
 	if state, exists := cp.nodes[nodeID]; exists {
 		state.Syncing = false
 		log.Printf("Node %s confirmed synced", nodeID)
-	}
-}
-
-func (cp *ControlPlane) monitorHealth() {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	wasLeader := false
-	raftPeerFailures := make(map[raft.ServerID]int)
-	const maxRaftPeerFailures = 3
-
-	for range ticker.C {
-		isLeader := cp.raft != nil && cp.raft.State() == raft.Leader
-
-		if isLeader && !wasLeader {
-			cp.mu.Lock()
-			log.Println("Elected as leader, resetting all data plane node heartbeat timers.")
-			for nodeID := range cp.nodes {
-				cp.lastHeartbeats[nodeID] = time.Now()
-			}
-			cp.mu.Unlock()
-			raftPeerFailures = make(map[raft.ServerID]int)
-		}
-
-		if isLeader {
-			cp.checkHealth()
-
-			configFuture := cp.raft.GetConfiguration()
-			if err := configFuture.Error(); err != nil {
-				log.Printf("Error getting Raft configuration: %v", err)
-				continue
-			}
-			config := configFuture.Configuration()
-			localID := raft.ServerID(cp.raft.Stats()["id"])
-
-			for _, server := range config.Servers {
-				if server.ID == localID {
-					continue
-				}
-
-				raftTransportAddr := string(server.Address)
-				conn, err := net.DialTimeout("tcp", raftTransportAddr, 1*time.Second)
-				if err != nil {
-					raftPeerFailures[server.ID]++
-					log.Printf("Raft peer %s at %s unreachable (%d/%d failures)", server.ID, raftTransportAddr, raftPeerFailures[server.ID], maxRaftPeerFailures)
-					if raftPeerFailures[server.ID] >= maxRaftPeerFailures {
-						log.Printf("Raft peer %s at %s consistently unreachable. Proposing removal from Raft cluster.", server.ID, raftTransportAddr)
-						removeFuture := cp.raft.RemoveServer(server.ID, 0, 0)
-						if err := removeFuture.Error(); err != nil {
-							log.Printf("Failed to remove Raft peer %s: %v", server.ID, err)
-						} else {
-							log.Printf("Successfully proposed removal of Raft peer %s", server.ID)
-							delete(raftPeerFailures, server.ID)
-						}
-					}
-				} else {
-					_ = conn.Close()
-					if raftPeerFailures[server.ID] > 0 {
-						log.Printf("Raft peer %s at %s is now reachable. Resetting failure count.", server.ID, raftTransportAddr)
-						delete(raftPeerFailures, server.ID)
-					}
-				}
-			}
-		} else {
-			raftPeerFailures = make(map[raft.ServerID]int)
-		}
-		wasLeader = isLeader
-	}
-}
-
-func (cp *ControlPlane) checkHealth() {
-	cp.mu.RLock()
-	var unhealthyNodes []string
-	now := time.Now()
-	for nodeID, lastHB := range cp.lastHeartbeats {
-		if now.Sub(lastHB) > 15*time.Second {
-			if state, exists := cp.nodes[nodeID]; exists && state.Healthy {
-				log.Printf("Leader detected node %s as unhealthy.", nodeID)
-				unhealthyNodes = append(unhealthyNodes, nodeID)
-			}
-		}
-	}
-	cp.mu.RUnlock()
-
-	if len(unhealthyNodes) == 0 {
-		return
-	}
-
-	var removalApplied bool
-	for _, nodeID := range unhealthyNodes {
-		cmdData, err := json.Marshal(nodeID)
-		if err != nil {
-			log.Printf("Error marshalling remove command data for %s: %v", nodeID, err)
-			continue
-		}
-		cmd := &Command{Op: "remove", Data: cmdData}
-		cmdBytes, err := json.Marshal(cmd)
-		if err != nil {
-			log.Printf("Error marshalling remove command for %s: %v", nodeID, err)
-			continue
-		}
-
-		log.Printf("Leader proposing removal of node %s", nodeID)
-		f := cp.raft.Apply(cmdBytes, 500*time.Millisecond)
-		if err := f.Error(); err != nil {
-			log.Printf("Failed to apply removal for node %s: %v", nodeID, err)
-		} else {
-			removalApplied = true
-		}
-	}
-
-	if removalApplied {
-		time.Sleep(250 * time.Millisecond)
-		cp.mu.RLock()
-		defer cp.mu.RUnlock()
-		cp.notifyAllNodes()
 	}
 }
 
