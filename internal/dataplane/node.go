@@ -95,13 +95,66 @@ func NewNode(nodeID, address, dbPath, controlAddr string, testing bool) (*Node, 
 func (n *Node) SetRole(role NodeRole, nextNode, prevNode string) {
 	n.topologyMu.Lock()
 	defer n.topologyMu.Unlock()
+
+	//changedNextNode := n.nextNode != nextNode
+	changedPrevNode := n.prevNode != prevNode
 	if n.role == role && n.nextNode == nextNode && n.prevNode == prevNode {
 		return
 	}
+
 	n.role = role
 	n.nextNode = nextNode
 	n.prevNode = prevNode
-	log.Printf("Node %s role set to %v, next node: %s, prev node: %s", n.nodeID, role, nextNode, prevNode)
+	log.Printf("Node %s role set to %v, next node: %s, prev node: %s", n.nodeID, n.role, n.nextNode, n.prevNode)
+
+	lastSeq := n.storage.GetLastSequence()
+	lastAck, _ := n.storage.GetLastAcked()
+	if n.role == RoleTail {
+		// The old tail may have not sent us all ACKs yet, so generate the latest ACK here.
+		log.Printf("Role changed to tail, sending %d as last ACK", lastSeq)
+		if err := n.storage.UpdateLastAcked(lastSeq); err != nil {
+			log.Printf("Failed to update last acked: %v", err)
+		}
+		n.ackQueue <- lastSeq
+	}
+
+	if changedPrevNode && n.prevNode != "" {
+		n.ackQueue <- lastAck
+
+		// Stream operation from lastSeq+1
+		conn, err := grpc.NewClient(n.prevNode, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			// TODO: handle error
+			return
+		}
+		defer conn.Close()
+		prevNodeClient := pb.NewReplicationClient(conn)
+		stream, err := prevNodeClient.StreamLog(context.Background(), &pb.StreamLogRequest{FromSequence: lastSeq + 1})
+		if err != nil {
+			// TODO: handle error
+			return
+		}
+
+		for {
+			op, err := stream.Recv()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				// TODO: handle error
+				// stream error
+				return
+			}
+			// Apply op
+			log.Printf("Applying %d, %s", op.Sequence, op.Operation)
+			_, err = n.applyWriteOp(op)
+			if err != nil {
+				//return fmt.Errorf("failed to apply op %d: %v", op.Sequence, err)
+				// TODO: handle error
+				// No return here, because this might happen if we applied a duplicate
+			}
+		}
+	}
 }
 
 func (n *Node) checkSyncing() error {
@@ -114,7 +167,7 @@ func (n *Node) checkSyncing() error {
 }
 
 func (n *Node) NotifyStateChange(_ context.Context, req *pb.StateChangeNotification) (*emptypb.Empty, error) {
-	log.Printf("Received state change: prevNode=%s, nextNode=%s, isHead=%v, isTail=%v", req.PrevNode, req.NextNode, req.IsHead, req.IsTail)
+	log.Printf("Node %s received state change: prevNode=%s, nextNode=%s, isHead=%v, isTail=%v", n.nodeID, req.PrevNode, req.NextNode, req.IsHead, req.IsTail)
 
 	prevNode := req.PrevNode
 	nextNode := req.NextNode
@@ -728,6 +781,20 @@ func (n *Node) SubscribeTopic(req *pb.SubscribeTopicRequest, stream pb.MessageBo
 // Replication
 func (n *Node) ReplicateWrite(_ context.Context, req *pb.ReplicationRequest) (*emptypb.Empty, error) {
 	op := req.Op
+
+	// If testing is enabled and this is node4, check if we should freeze
+	if n.testing && n.nodeID == "node4" {
+		if op.Operation != nil {
+			if postMsg, ok := op.Operation.(*pb.WriteOp_PostMessage); ok {
+				if postMsg.PostMessage.Text == "node4freeze" {
+					log.Printf("Node %s freezing on message 'node4freeze'", n.nodeID)
+					// Freeze indefinitely (or until killed)
+					select {}
+				}
+			}
+		}
+	}
+
 	event, err := n.applyWriteOp(op)
 	if err != nil {
 		return nil, err
@@ -757,6 +824,8 @@ func (n *Node) applyWriteOp(op *pb.WriteOp) (*pb.MessageEvent, error) {
 	if _, err := n.storage.LogOperation(op); err != nil {
 		return nil, err
 	}
+
+	// TODO: if the operation is a duplicate, return nil, nil here
 
 	switch o := op.Operation.(type) {
 	case *pb.WriteOp_CreateUser:
@@ -881,6 +950,8 @@ func (n *Node) replicateWrite(ctx context.Context, op *pb.WriteOp) error {
 			return nil
 		}
 
+		log.Printf("Sending replicate write (seq %d) from %s to %s", op.Sequence, n.nodeID, next)
+
 		err := func() error {
 			conn, err := grpc.NewClient(next, grpc.WithTransportCredentials(insecure.NewCredentials()))
 			if err != nil {
@@ -926,6 +997,8 @@ func (n *Node) acknowledgeWrite(ctx context.Context, sequence int64) error {
 		if prev == "" {
 			return nil
 		}
+
+		log.Printf("Sending ACK %d from %s to %s", sequence, n.nodeID, prev)
 
 		err := func() error {
 			conn, err := grpc.NewClient(prev, grpc.WithTransportCredentials(insecure.NewCredentials()))

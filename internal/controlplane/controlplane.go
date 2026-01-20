@@ -144,6 +144,7 @@ func (cp *ControlPlane) ConfirmSynced(_ context.Context, req *pb.ConfirmSyncedRe
 	if state, exists := cp.nodes[req.NodeId]; exists {
 		state.Syncing = false
 		log.Printf("Node %s confirmed synced", req.NodeId)
+		cp.logReconfiguration()
 		cp.notifyAllNodes() // It would be better to only notify the tail, but this is easier to write.
 	}
 	return &emptypb.Empty{}, nil
@@ -219,18 +220,23 @@ func (cp *ControlPlane) logReconfiguration() {
 			role = "TAIL"
 		}
 
+		prevAddr := ""
+		if i > 0 {
+			prevAddr = cp.chain[i-1].Address
+		}
+
 		nextAddr := ""
 		if i < len(cp.chain)-1 {
 			nextAddr = cp.chain[i+1].Address
 		}
 
-		log.Printf("  [%d] %s (%s) -> %s, next: %s", i, node.NodeId, node.Address, role, nextAddr)
+		log.Printf("  [%d] %s (%s) -> %s, prev: %s, next: %s", i, node.NodeId, node.Address, role, prevAddr, nextAddr)
 	}
 }
 
 func (cp *ControlPlane) notifyAllNodes() {
 	for i, node := range cp.chain {
-		var prevNode, nextNode string
+		prevNode, nextNode := "", ""
 
 		if i > 0 {
 			prevNode = cp.chain[i-1].Address
