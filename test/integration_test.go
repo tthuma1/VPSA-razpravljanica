@@ -106,26 +106,21 @@ func startNodeWithStopper(t *testing.T, id string, port int, controlAddr string,
 
 					if state.Head.NodeId == id {
 						role = dataplane.RoleHead
-						if len(chainState.Chain) > 1 {
-							nextNode = chainState.Chain[1].Address
-						}
 					} else if state.Tail.NodeId == id {
 						role = dataplane.RoleTail
-						if len(chainState.Chain) > 1 {
-							prevNode = chainState.Chain[len(chainState.Chain)-2].Address
-						}
 					} else {
 						role = dataplane.RoleMiddle
-						for i, n := range chainState.Chain {
-							if n.NodeId == id {
-								if i < len(chainState.Chain)-1 {
-									nextNode = chainState.Chain[i+1].Address
-								}
-								if i > 0 {
-									prevNode = chainState.Chain[i-1].Address
-								}
-								break
+					}
+
+					for i, n := range chainState.Chain {
+						if n.NodeId == id {
+							if i < len(chainState.Chain)-1 {
+								nextNode = chainState.Chain[i+1].Address
 							}
+							if i > 0 {
+								prevNode = chainState.Chain[i-1].Address
+							}
+							break
 						}
 					}
 					node.SetRole(role, nextNode, prevNode)
