@@ -49,17 +49,17 @@ echo ""
 
 # Start Data Nodes
 echo "Starting Data Node 1 (HEAD)..."
-./bin/server -id=dp-node1 -port=8081 -control=localhost:50051 -db=dp1.db > logs/dp1.log 2>&1 &
+./bin/server -id=dp-node1 -port=8081 -control=localhost:50051,localhost:50052,localhost:50053 -db=dp1.db > logs/dp1.log 2>&1 &
 DP1_PID=$!
 sleep 2
 
 echo "Starting Data Node 2 (MIDDLE)..."
-./bin/server -id=dp-node2 -port=8082 -control=localhost:50051 -db=dp2.db > logs/dp2.log 2>&1 &
+./bin/server -id=dp-node2 -port=8082 -control=localhost:50051,localhost:50052,localhost:50053 -db=dp2.db > logs/dp2.log 2>&1 &
 DP2_PID=$!
 sleep 2
 
 echo "Starting Data Node 3 (TAIL)..."
-./bin/server -id=dp-node3 -port=8083 -control=localhost:50051 -db=dp3.db > logs/dp3.log 2>&1 &
+./bin/server -id=dp-node3 -port=8083 -control=localhost:50051,localhost:50052,localhost:50053 -db=dp3.db > logs/dp3.log 2>&1 &
 DP3_PID=$!
 sleep 2
 

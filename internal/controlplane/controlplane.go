@@ -13,6 +13,8 @@ import (
 	pb "messageboard/proto"
 
 	"github.com/hashicorp/raft"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -52,10 +54,35 @@ func NewControlPlane() *ControlPlane {
 	return cp
 }
 
+func (cp *ControlPlane) GetLeader(
+	_ context.Context,
+	_ *emptypb.Empty,
+) (*pb.LeaderResponse, error) {
+
+	if cp.raft == nil {
+		return nil, status.Error(codes.Unavailable, "raft not initialized")
+	}
+
+	leaderAddr, leaderID := cp.raft.LeaderWithID()
+
+	if leaderAddr == "" {
+		return nil, status.Error(codes.Unavailable, "no leader elected")
+	}
+
+	return &pb.LeaderResponse{
+		RaftId:  string(leaderID),
+		Address: string(leaderAddr),
+	}, nil
+}
+
 func (cp *ControlPlane) RegisterNode(_ context.Context, req *pb.RegisterNodeRequest) (*emptypb.Empty, error) {
 	if cp.raft.State() != raft.Leader {
 		leaderAddr, _ := cp.raft.LeaderWithID()
-		return nil, fmt.Errorf("not the leader, current leader is at %s", leaderAddr)
+		return nil, status.Errorf(
+			codes.FailedPrecondition,
+			"NOT_LEADER:%s",
+			leaderAddr,
+		)
 	}
 
 	cmdData, err := json.Marshal(&pb.NodeInfo{NodeId: req.NodeId, Address: req.Address})
