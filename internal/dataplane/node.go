@@ -499,6 +499,60 @@ func (n *Node) JoinTopic(ctx context.Context, req *pb.JoinTopicRequest) (*emptyp
 	return &emptypb.Empty{}, nil
 }
 
+func (n *Node) LeaveTopic(ctx context.Context, req *pb.LeaveTopicRequest) (*emptypb.Empty, error) {
+	if err := n.checkSyncing(); err != nil {
+		return nil, err
+	}
+	if n.role != RoleHead {
+		return nil, fmt.Errorf("not the head node")
+	}
+
+	err := n.storage.RemoveTopicParticipant(req.TopicId, req.UserId)
+	if err != nil {
+		return nil, err
+	}
+
+	if n.nextNode != "" {
+		seq, err := n.storage.LogOperation(&pb.WriteOp{
+			Operation: &pb.WriteOp_LeaveTopic{LeaveTopic: req},
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		errChan := make(chan error, 1)
+		n.pendingMu.Lock()
+		n.pendingWrites[seq] = errChan
+		n.pendingMu.Unlock()
+
+		err = n.replicateWrite(ctx, &pb.WriteOp{
+			Operation: &pb.WriteOp_LeaveTopic{LeaveTopic: req},
+			Sequence:  seq,
+		})
+		if err != nil {
+			n.pendingMu.Lock()
+			delete(n.pendingWrites, seq)
+			n.pendingMu.Unlock()
+			return nil, err
+		}
+
+		// Wait for acknowledgement
+		select {
+		case err := <-errChan:
+			if err != nil {
+				return nil, err
+			}
+		case <-ctx.Done():
+			n.pendingMu.Lock()
+			delete(n.pendingWrites, seq)
+			n.pendingMu.Unlock()
+			return nil, ctx.Err()
+		}
+	}
+
+	return &emptypb.Empty{}, nil
+}
+
 // Read operations
 func (n *Node) ListTopics(ctx context.Context, req *pb.ListTopicsRequest) (*pb.ListTopicsResponse, error) {
 	if err := n.checkSyncing(); err != nil {
@@ -736,6 +790,11 @@ func (n *Node) applyWriteOp(op *pb.WriteOp) (*pb.MessageEvent, error) {
 		}, nil
 	case *pb.WriteOp_JoinTopic:
 		err := n.storage.AddTopicParticipant(o.JoinTopic.TopicId, o.JoinTopic.UserId)
+		if err != nil {
+			return nil, err
+		}
+	case *pb.WriteOp_LeaveTopic:
+		err := n.storage.RemoveTopicParticipant(o.LeaveTopic.TopicId, o.LeaveTopic.UserId)
 		if err != nil {
 			return nil, err
 		}

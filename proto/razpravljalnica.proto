@@ -73,6 +73,7 @@ service MessageBoard {
   rpc GetMessagesByUser(GetMessagesByUserRequest) returns (GetMessagesResponse);
   rpc SubscribeTopic(SubscribeTopicRequest) returns (stream MessageEvent);
   rpc JoinTopic(JoinTopicRequest) returns (google.protobuf.Empty);
+  rpc LeaveTopic(LeaveTopicRequest) returns (google.protobuf.Empty);
   rpc ListAllTopics(google.protobuf.Empty) returns (ListTopicsResponse);
   rpc ListJoinableTopics(ListJoinableTopicsRequest) returns (ListTopicsResponse);
 }
@@ -185,6 +186,11 @@ message JoinTopicRequest {
   int64 user_id = 2;
 }
 
+message LeaveTopicRequest {
+  int64 topic_id = 1;
+  int64 user_id = 2;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // Control plane
 ////////////////////////////////////////////////////////////////////////////////
@@ -246,8 +252,9 @@ message WriteOp {
     PostMessageRequest post_message = 3;
     LikeMessageRequest like_message = 4;
     JoinTopicRequest join_topic = 5;
+    LeaveTopicRequest leave_topic = 6;
   }
-  int64 sequence = 6;
+  int64 sequence = 7;
 }
 
 message AcknowledgeRequest {

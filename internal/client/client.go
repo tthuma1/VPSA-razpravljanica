@@ -176,6 +176,13 @@ func (c *Client) JoinTopic(ctx context.Context, topicID int64) error {
 	})
 }
 
+func (c *Client) LeaveTopic(ctx context.Context, topicID int64) error {
+	return c.withRetry(func() error {
+		_, err := c.headClient.LeaveTopic(ctx, &pb.LeaveTopicRequest{TopicId: topicID, UserId: c.currentUser.Id})
+		return err
+	})
+}
+
 func (c *Client) getTopicID(ctx context.Context, name string) (int64, error) {
 	topic, err := c.getReadClient().GetTopic(ctx, &pb.GetTopicRequest{Name: name})
 	if err != nil {
