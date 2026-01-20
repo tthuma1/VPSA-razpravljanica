@@ -723,7 +723,7 @@ func (n *Node) GetSubscriptionNode(_ context.Context, _ *pb.SubscriptionNodeRequ
 
 	token := generateToken()
 
-	// Simple round-robin load balancing - assign to self for now
+	// TODO: Simple round-robin load balancing - assign to self for now
 	return &pb.SubscriptionNodeResponse{
 		SubscribeToken: token,
 		Node: &pb.NodeInfo{

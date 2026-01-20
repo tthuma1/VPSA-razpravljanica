@@ -91,16 +91,16 @@ func registerWithControlPlane(nodeID, address, controlAddrsStr string, node *dat
 		mu.Lock()
 		defer mu.Unlock()
 
-		for _, addr := range controlAddrs {
-			var tempConn *grpc.ClientConn
-			tempConn, err = grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		for _, cpAddr := range controlAddrs {
+			var cpClientConn *grpc.ClientConn
+			cpClientConn, err = grpc.NewClient(cpAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 			if err != nil {
 				continue
 			}
-			client := pb.NewControlPlaneClient(tempConn)
+			cpClient := pb.NewControlPlaneClient(cpClientConn)
 
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			_, err = client.RegisterNode(ctx, &pb.RegisterNodeRequest{
+			_, err = cpClient.RegisterNode(ctx, &pb.RegisterNodeRequest{
 				NodeId:  nodeID,
 				Address: address,
 			})
@@ -110,14 +110,14 @@ func registerWithControlPlane(nodeID, address, controlAddrsStr string, node *dat
 				if conn != nil {
 					conn.Close()
 				}
-				conn = tempConn
-				controlPlaneClient = client
-				log.Printf("Registered with control plane at %s", addr)
+				conn = cpClientConn
+				controlPlaneClient = cpClient
+				log.Printf("Registered with control plane at %s", cpAddr)
 				return nil
 			}
 
 			if leaderAddr := parseLeaderRedirect(err); leaderAddr != "" {
-				tempConn.Close() // Close connection to follower
+				cpClientConn.Close() // Close connection to follower
 				log.Printf("Redirecting to leader at %s", leaderAddr)
 
 				if conn != nil {
@@ -125,21 +125,21 @@ func registerWithControlPlane(nodeID, address, controlAddrsStr string, node *dat
 				}
 				conn, err = grpc.NewClient(leaderAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 				if err == nil {
-					client = pb.NewControlPlaneClient(conn)
+					cpClient = pb.NewControlPlaneClient(conn)
 					ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-					_, err = client.RegisterNode(ctx, &pb.RegisterNodeRequest{
+					_, err = cpClient.RegisterNode(ctx, &pb.RegisterNodeRequest{
 						NodeId:  nodeID,
 						Address: address,
 					})
 					cancel()
 					if err == nil {
-						controlPlaneClient = client
+						controlPlaneClient = cpClient
 						log.Printf("Registered with control plane leader at %s", leaderAddr)
 						return nil
 					}
 				}
 			}
-			tempConn.Close()
+			cpClientConn.Close()
 		}
 		return fmt.Errorf("failed to register with any control plane node")
 	}

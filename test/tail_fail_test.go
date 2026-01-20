@@ -19,21 +19,58 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
-// Helper to start a control plane
-func startControlPlaneTailTest(t *testing.T, port int) (*grpc.Server, string) {
-	lis, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", port))
-	if err != nil {
-		t.Fatalf("failed to listen: %v", err)
-	}
-	s := grpc.NewServer()
-	cp := controlplane.NewControlPlane()
-	pb.RegisterControlPlaneServer(s, cp)
-	go func() {
-		if err := s.Serve(lis); err != nil {
-			// t.Errorf("failed to serve: %v", err)
+// Helper to start a control plane with fixed ports matching the static config
+func startControlPlaneTailTestFixed(t *testing.T, baseGrpcPort int) ([]*grpc.Server, string) {
+	var servers []*grpc.Server
+	var addrs []string
+
+	// The static config in controlplane.go expects:
+	// node1: localhost:60051
+	// node2: localhost:60052
+	// node3: localhost:60053
+	raftPorts := []int{60051, 60052, 60053}
+
+	for i := 0; i < 3; i++ {
+		nodeID := fmt.Sprintf("node%d", i+1)
+		grpcPort := baseGrpcPort + i
+		raftPort := raftPorts[i]
+
+		lis, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", grpcPort))
+		if err != nil {
+			t.Fatalf("failed to listen: %v", err)
 		}
-	}()
-	return s, lis.Addr().String()
+
+		raftDir, err := os.MkdirTemp("", fmt.Sprintf("raft-tail-fail-test-%s-*", nodeID))
+		if err != nil {
+			t.Fatalf("failed to create raft dir: %v", err)
+		}
+		t.Cleanup(func() { os.RemoveAll(raftDir) })
+
+		s := grpc.NewServer()
+		cp := controlplane.NewControlPlane()
+
+		raftAddr := fmt.Sprintf("localhost:%d", raftPort)
+		// Bootstrap only the first node
+		bootstrap := i == 0
+		if err := cp.SetupRaft(nodeID, raftAddr, raftDir, bootstrap); err != nil {
+			t.Fatalf("failed to setup raft: %v", err)
+		}
+
+		pb.RegisterControlPlaneServer(s, cp)
+		go func() {
+			if err := s.Serve(lis); err != nil {
+				// t.Errorf("failed to serve: %v", err)
+			}
+		}()
+
+		servers = append(servers, s)
+		addrs = append(addrs, lis.Addr().String())
+	}
+
+	// Wait for cluster to form
+	time.Sleep(5 * time.Second)
+
+	return servers, fmt.Sprintf("%s,%s,%s", addrs[0], addrs[1], addrs[2])
 }
 
 // Improved node starter that returns a stop function
@@ -64,7 +101,17 @@ func startNodeWithStopperTailTest(t *testing.T, id string, port int, controlAddr
 
 	// Register with control plane
 	go func() {
-		conn, err := grpc.NewClient(controlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		// Parse controlAddr to find a working CP node
+		// We'll try the first one for simplicity, assuming it's the leader or redirects
+		targetCP := controlAddr
+		for i, c := range controlAddr {
+			if c == ',' {
+				targetCP = controlAddr[:i]
+				break
+			}
+		}
+
+		conn, err := grpc.NewClient(targetCP, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			return
 		}
@@ -146,9 +193,15 @@ func startNodeWithStopperTailTest(t *testing.T, id string, port int, controlAddr
 }
 
 func TestTailFailScenario(t *testing.T) {
-	// 1. Start Control Plane
-	cpServer, cpAddr := startControlPlaneTailTest(t, 50056)
-	defer cpServer.Stop()
+	// 1. Start Control Plane (Cluster of 3)
+	// We use ports 50056, 50057, 50058 for gRPC
+	// And 60051, 60052, 60053 for Raft (fixed in startControlPlaneTailTestFixed)
+	cpServers, cpAddr := startControlPlaneTailTestFixed(t, 50056)
+	defer func() {
+		for _, s := range cpServers {
+			s.Stop()
+		}
+	}()
 
 	// 2. Start 4 Nodes
 	// Node 1
