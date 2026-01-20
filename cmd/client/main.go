@@ -610,6 +610,11 @@ func (c *UIClient) refreshTopics() {
 	c.cachedTopics = topics
 	c.topicList.Clear()
 
+	// Clear highlights so tview state is reset
+	c.navigating = true
+	c.topicList.Highlight()
+	c.navigating = false
+
 	const lineWidth = 15
 	const icon = "x"
 
