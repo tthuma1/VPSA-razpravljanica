@@ -196,11 +196,17 @@ message LeaveTopicRequest {
 ////////////////////////////////////////////////////////////////////////////////
 
 service ControlPlane {
+  rpc GetLeader(google.protobuf.Empty) returns (LeaderResponse);
   rpc GetClusterState(google.protobuf.Empty) returns (GetClusterStateResponse);
   rpc RegisterNode(RegisterNodeRequest) returns (google.protobuf.Empty);
   rpc Heartbeat(HeartbeatRequest) returns (google.protobuf.Empty);
   rpc GetChainState(google.protobuf.Empty) returns (ChainStateResponse);
   rpc ConfirmSynced(ConfirmSyncedRequest) returns (google.protobuf.Empty);
+}
+
+message LeaderResponse {
+  string raft_id = 1;
+  string address = 2;
 }
 
 message ConfirmSyncedRequest {

@@ -14,5 +14,5 @@ if [ -f ".pids" ]; then
     echo "Cluster stopped."
 else
     echo "No .pids file found. Cluster may not be running."
-    echo "You can manually check with: ps aux | grep -E 'controlplane|id=node'"
+    echo "You can manually check with: ps aux | grep -E 'controlplane|db='"
 fi

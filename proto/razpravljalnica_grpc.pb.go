@@ -774,6 +774,7 @@ var MessageBoard_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
+	ControlPlane_GetLeader_FullMethodName       = "/razpravljalnica.ControlPlane/GetLeader"
 	ControlPlane_GetClusterState_FullMethodName = "/razpravljalnica.ControlPlane/GetClusterState"
 	ControlPlane_RegisterNode_FullMethodName    = "/razpravljalnica.ControlPlane/RegisterNode"
 	ControlPlane_Heartbeat_FullMethodName       = "/razpravljalnica.ControlPlane/Heartbeat"
@@ -785,6 +786,7 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type ControlPlaneClient interface {
+	GetLeader(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*LeaderResponse, error)
 	GetClusterState(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*GetClusterStateResponse, error)
 	RegisterNode(ctx context.Context, in *RegisterNodeRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
@@ -798,6 +800,16 @@ type controlPlaneClient struct {
 
 func NewControlPlaneClient(cc grpc.ClientConnInterface) ControlPlaneClient {
 	return &controlPlaneClient{cc}
+}
+
+func (c *controlPlaneClient) GetLeader(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*LeaderResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(LeaderResponse)
+	err := c.cc.Invoke(ctx, ControlPlane_GetLeader_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (c *controlPlaneClient) GetClusterState(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*GetClusterStateResponse, error) {
@@ -854,6 +866,7 @@ func (c *controlPlaneClient) ConfirmSynced(ctx context.Context, in *ConfirmSynce
 // All implementations must embed UnimplementedControlPlaneServer
 // for forward compatibility.
 type ControlPlaneServer interface {
+	GetLeader(context.Context, *emptypb.Empty) (*LeaderResponse, error)
 	GetClusterState(context.Context, *emptypb.Empty) (*GetClusterStateResponse, error)
 	RegisterNode(context.Context, *RegisterNodeRequest) (*emptypb.Empty, error)
 	Heartbeat(context.Context, *HeartbeatRequest) (*emptypb.Empty, error)
@@ -869,6 +882,9 @@ type ControlPlaneServer interface {
 // pointer dereference when methods are called.
 type UnimplementedControlPlaneServer struct{}
 
+func (UnimplementedControlPlaneServer) GetLeader(context.Context, *emptypb.Empty) (*LeaderResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetLeader not implemented")
+}
 func (UnimplementedControlPlaneServer) GetClusterState(context.Context, *emptypb.Empty) (*GetClusterStateResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetClusterState not implemented")
 }
@@ -903,6 +919,24 @@ func RegisterControlPlaneServer(s grpc.ServiceRegistrar, srv ControlPlaneServer)
 		t.testEmbeddedByValue()
 	}
 	s.RegisterService(&ControlPlane_ServiceDesc, srv)
+}
+
+func _ControlPlane_GetLeader_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlPlaneServer).GetLeader(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlPlane_GetLeader_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlPlaneServer).GetLeader(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
 }
 
 func _ControlPlane_GetClusterState_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -1002,6 +1036,10 @@ var ControlPlane_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "razpravljalnica.ControlPlane",
 	HandlerType: (*ControlPlaneServer)(nil),
 	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "GetLeader",
+			Handler:    _ControlPlane_GetLeader_Handler,
+		},
 		{
 			MethodName: "GetClusterState",
 			Handler:    _ControlPlane_GetClusterState_Handler,
