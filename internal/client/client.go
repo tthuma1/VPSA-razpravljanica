@@ -49,20 +49,6 @@ func (c *Client) Connect(controlAddr string) error {
 }
 
 func (c *Client) RefreshTopology() error {
-	// If controlAddr is actually a node address (for testing), we might fail to get chain state if it's not a control plane.
-	// But in our architecture, clients talk to control plane to get topology.
-	// In the test, we passed "localhost:50061" (node1) to Connect.
-	// This is wrong if Connect expects Control Plane address.
-	// However, the test code I wrote passed node address.
-	// Let's check if we can make it robust.
-	// If we pass a node address, we can't get chain state from it (it doesn't implement ControlPlane service).
-	// So the test code was wrong to pass node address to Connect if Connect expects CP address.
-	// BUT, the prompt said "CLI client application that connects to the control plane to discover head and tail nodes".
-	// So Connect SHOULD take Control Plane address.
-	// In my test, I passed node address. I should fix the test.
-	// But wait, I am editing client.go now.
-	// I will keep it as is (expecting CP address).
-
 	conn, err := grpc.NewClient(c.ControlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return fmt.Errorf("failed to connect to control plane: %w", err)

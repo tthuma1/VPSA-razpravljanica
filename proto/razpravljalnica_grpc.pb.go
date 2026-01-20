@@ -995,6 +995,7 @@ const (
 	Replication_NotifyEvent_FullMethodName      = "/razpravljalnica.Replication/NotifyEvent"
 	Replication_AcknowledgeWrite_FullMethodName = "/razpravljalnica.Replication/AcknowledgeWrite"
 	Replication_GetLastAcked_FullMethodName     = "/razpravljalnica.Replication/GetLastAcked"
+	Replication_GetLastSequence_FullMethodName  = "/razpravljalnica.Replication/GetLastSequence"
 )
 
 // ReplicationClient is the client API for Replication service.
@@ -1006,6 +1007,7 @@ type ReplicationClient interface {
 	NotifyEvent(ctx context.Context, in *MessageEvent, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	AcknowledgeWrite(ctx context.Context, in *AcknowledgeRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	GetLastAcked(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*GetLastAckedResponse, error)
+	GetLastSequence(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*GetLastSequenceResponse, error)
 }
 
 type replicationClient struct {
@@ -1075,6 +1077,16 @@ func (c *replicationClient) GetLastAcked(ctx context.Context, in *emptypb.Empty,
 	return out, nil
 }
 
+func (c *replicationClient) GetLastSequence(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*GetLastSequenceResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetLastSequenceResponse)
+	err := c.cc.Invoke(ctx, Replication_GetLastSequence_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ReplicationServer is the server API for Replication service.
 // All implementations must embed UnimplementedReplicationServer
 // for forward compatibility.
@@ -1084,6 +1096,7 @@ type ReplicationServer interface {
 	NotifyEvent(context.Context, *MessageEvent) (*emptypb.Empty, error)
 	AcknowledgeWrite(context.Context, *AcknowledgeRequest) (*emptypb.Empty, error)
 	GetLastAcked(context.Context, *emptypb.Empty) (*GetLastAckedResponse, error)
+	GetLastSequence(context.Context, *emptypb.Empty) (*GetLastSequenceResponse, error)
 	mustEmbedUnimplementedReplicationServer()
 }
 
@@ -1108,6 +1121,9 @@ func (UnimplementedReplicationServer) AcknowledgeWrite(context.Context, *Acknowl
 }
 func (UnimplementedReplicationServer) GetLastAcked(context.Context, *emptypb.Empty) (*GetLastAckedResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetLastAcked not implemented")
+}
+func (UnimplementedReplicationServer) GetLastSequence(context.Context, *emptypb.Empty) (*GetLastSequenceResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetLastSequence not implemented")
 }
 func (UnimplementedReplicationServer) mustEmbedUnimplementedReplicationServer() {}
 func (UnimplementedReplicationServer) testEmbeddedByValue()                     {}
@@ -1213,6 +1229,24 @@ func _Replication_GetLastAcked_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Replication_GetLastSequence_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ReplicationServer).GetLastSequence(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Replication_GetLastSequence_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ReplicationServer).GetLastSequence(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Replication_ServiceDesc is the grpc.ServiceDesc for Replication service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1235,6 +1269,10 @@ var Replication_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetLastAcked",
 			Handler:    _Replication_GetLastAcked_Handler,
+		},
+		{
+			MethodName: "GetLastSequence",
+			Handler:    _Replication_GetLastSequence_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

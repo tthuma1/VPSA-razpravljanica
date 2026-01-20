@@ -639,7 +639,10 @@ func (s *Storage) GetLastSequence() int64 {
 	defer s.mu.RUnlock()
 
 	var seq int64
-	s.db.QueryRow("SELECT last_seq FROM sequence WHERE id = 1").Scan(&seq)
+	err := s.db.QueryRow("SELECT last_seq FROM sequence WHERE id = 1").Scan(&seq)
+	if err != nil {
+		return 0
+	}
 	return seq
 }
 

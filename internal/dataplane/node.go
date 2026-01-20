@@ -774,6 +774,11 @@ func (n *Node) GetLastAcked(_ context.Context, _ *emptypb.Empty) (*pb.GetLastAck
 	return &pb.GetLastAckedResponse{Sequence: seq}, nil
 }
 
+func (n *Node) GetLastSequence(_ context.Context, _ *emptypb.Empty) (*pb.GetLastSequenceResponse, error) {
+	seq := n.storage.GetLastSequence()
+	return &pb.GetLastSequenceResponse{Sequence: seq}, nil
+}
+
 func (n *Node) runReplicationWorker() {
 	for op := range n.replQueue {
 		if err := n.replicateWrite(context.Background(), op); err != nil {
@@ -991,7 +996,22 @@ func (n *Node) SyncWithTail(ctx context.Context) error {
 		}
 	}
 
-	log.Printf("Sync completed")
+	log.Printf("Sync completed, verifying sequence numbers...")
+
+	tailLastSeqResponse, err := client.GetLastSequence(ctx, &emptypb.Empty{})
+
+	if err != nil {
+		return fmt.Errorf("failed to get tail state: %v", err)
+	}
+
+	tailLastSeq := tailLastSeqResponse.Sequence
+	localLastSeq := n.storage.GetLastSequence()
+	if localLastSeq != tailLastSeq {
+		return fmt.Errorf("sync verification failed: local sequence %d != tail sequence %d",
+			localLastSeq, tailLastSeq)
+	}
+
+	log.Printf("Sequence numbers match, confirming sync...")
 
 	// Confirm Synced
 	_, err = cpClient.ConfirmSynced(ctx, &pb.ConfirmSyncedRequest{NodeId: n.nodeID})
