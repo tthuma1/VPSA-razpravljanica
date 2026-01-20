@@ -603,11 +603,11 @@ func (c *UIClient) subscribe(ctx context.Context, topicNames []string) {
 			return
 		}
 
-		fmt.Printf("Subscription connection lost: %v. Reconnecting...\n", err)
+		c.statusLine.SetText(fmt.Sprintf("Subscription connection lost: %v. Reconnecting...\n", err))
 		time.Sleep(1 * time.Second)
 
 		if err := c.RefreshTopology(); err != nil {
-			fmt.Printf("Failed to refresh topology: %v. Retrying in 5s...\n", err)
+			c.statusLine.SetText(fmt.Sprintf("Failed to refresh topology: %v. Retrying in 5s...\n", err))
 			time.Sleep(5 * time.Second)
 		}
 	}

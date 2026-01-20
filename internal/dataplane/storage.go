@@ -157,7 +157,7 @@ func (s *Storage) CreateUser(name, password, salt string) (*pb.User, error) {
 		return nil, fmt.Errorf("user with name '%s' already exists", name)
 	}
 
-	// If salt is not provided (e.g. from client), generate it
+	// If salt is not provided, generate it
 	if salt == "" {
 		salt, err = generateSalt()
 		if err != nil {

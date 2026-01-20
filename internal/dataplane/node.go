@@ -1,4 +1,3 @@
-// internal/dataplane/node.go
 package dataplane
 
 import (
@@ -43,16 +42,8 @@ type Node struct {
 	// Subscription management
 	subscriptions map[string]*Subscription
 	subMu         sync.RWMutex
-	subCounter    int
 
-	// Event broadcast
-	eventListeners []chan *pb.MessageEvent
-	eventMu        sync.RWMutex
-
-	// Pending writes (Head only) and Unacknowledged writes (All nodes except Tail)
-	// Map sequence number to:
-	// - Head: channel for waiting client
-	// - Middle: nil (just tracking existence for read consistency)
+	// This map is used so that Head waits for ACK before sending a response to the client.
 	pendingWrites map[int64]chan error
 	pendingMu     sync.RWMutex
 
@@ -117,6 +108,26 @@ func (n *Node) checkSyncing() error {
 		return fmt.Errorf("node is syncing")
 	}
 	return nil
+}
+
+func (n *Node) NotifyStateChange(_ context.Context, req *pb.StateChangeNotification) (*emptypb.Empty, error) {
+	log.Printf("Received state change: prevNode=%s, nextNode=%s, isHead=%v, isTail=%v", req.PrevNode, req.NextNode, req.IsHead, req.IsTail)
+
+	prevNode := req.PrevNode
+	nextNode := req.NextNode
+	var role NodeRole
+
+	if req.IsHead {
+		role = RoleHead
+	} else if req.IsTail {
+		role = RoleTail
+	} else {
+		role = RoleMiddle
+	}
+
+	n.SetRole(role, nextNode, prevNode)
+
+	return &emptypb.Empty{}, nil
 }
 
 // Write operations (Head only)
@@ -337,8 +348,6 @@ func (n *Node) PostMessage(ctx context.Context, req *pb.PostMessageRequest) (*pb
 	n.broadcastEvent(event)
 
 	if n.nextNode != "" {
-		go n.notifyEvent(event)
-
 		errChan := make(chan error, 1)
 		n.pendingMu.Lock()
 		n.pendingWrites[seq] = errChan
@@ -403,8 +412,6 @@ func (n *Node) LikeMessage(ctx context.Context, req *pb.LikeMessageRequest) (*pb
 	n.broadcastEvent(event)
 
 	if n.nextNode != "" {
-		go n.notifyEvent(event)
-
 		errChan := make(chan error, 1)
 		n.pendingMu.Lock()
 		n.pendingWrites[seq] = errChan
@@ -580,7 +587,7 @@ func (n *Node) GetMessagesByUser(ctx context.Context, req *pb.GetMessagesByUserR
 }
 
 // Subscription handling
-func (n *Node) GetSubscriptionNode(ctx context.Context, req *pb.SubscriptionNodeRequest) (*pb.SubscriptionNodeResponse, error) {
+func (n *Node) GetSubscriptionNode(_ context.Context, _ *pb.SubscriptionNodeRequest) (*pb.SubscriptionNodeResponse, error) {
 	if err := n.checkSyncing(); err != nil {
 		return nil, err
 	}
@@ -654,20 +661,15 @@ func (n *Node) SubscribeTopic(req *pb.SubscribeTopicRequest, stream pb.MessageBo
 }
 
 // Replication
-func (n *Node) ReplicateWrite(ctx context.Context, req *pb.ReplicationRequest) (*emptypb.Empty, error) {
+func (n *Node) ReplicateWrite(_ context.Context, req *pb.ReplicationRequest) (*emptypb.Empty, error) {
 	op := req.Op
-
-	// Mark as unacknowledged before processing
-	if n.role != RoleTail {
-		n.pendingMu.Lock()
-		if _, exists := n.pendingWrites[op.Sequence]; !exists {
-			n.pendingWrites[op.Sequence] = nil
-		}
-		n.pendingMu.Unlock()
+	event, err := n.applyWriteOp(op)
+	if err != nil {
+		return nil, err
 	}
 
-	if err := n.applyWriteOp(op); err != nil {
-		return nil, err
+	if event != nil {
+		n.broadcastEvent(event)
 	}
 
 	// Forward to next node
@@ -685,10 +687,10 @@ func (n *Node) ReplicateWrite(ctx context.Context, req *pb.ReplicationRequest) (
 	return &emptypb.Empty{}, nil
 }
 
-func (n *Node) applyWriteOp(op *pb.WriteOp) error {
+func (n *Node) applyWriteOp(op *pb.WriteOp) (*pb.MessageEvent, error) {
 	// Log the operation first (idempotent)
 	if _, err := n.storage.LogOperation(op); err != nil {
-		return err
+		return nil, err
 	}
 
 	switch o := op.Operation.(type) {
@@ -697,48 +699,51 @@ func (n *Node) applyWriteOp(op *pb.WriteOp) error {
 		if err != nil {
 			// If user already exists, it might be due to replay. Check if it exists.
 			if _, errGet := n.storage.GetUserByName(o.CreateUser.Name); errGet == nil {
-				return nil
+				return nil, nil
 			}
-			return err
+			return nil, err
 		}
 	case *pb.WriteOp_CreateTopic:
 		_, err := n.storage.CreateTopic(o.CreateTopic.Name, o.CreateTopic.UserId)
 		if err != nil {
 			if _, errGet := n.storage.GetTopicByName(o.CreateTopic.Name); errGet == nil {
-				return nil
+				return nil, nil
 			}
-			return err
+			return nil, err
 		}
 	case *pb.WriteOp_PostMessage:
-		_, err := n.storage.PostMessage(o.PostMessage.TopicId, o.PostMessage.UserId, o.PostMessage.Text)
+		msg, err := n.storage.PostMessage(o.PostMessage.TopicId, o.PostMessage.UserId, o.PostMessage.Text)
 		if err != nil {
-			return err
+			return nil, err
 		}
+		return &pb.MessageEvent{
+			SequenceNumber: op.Sequence,
+			Op:             pb.OpType_OP_POST,
+			Message:        msg,
+			EventAt:        msg.CreatedAt,
+		}, nil
 	case *pb.WriteOp_LikeMessage:
-		_, err := n.storage.LikeMessage(o.LikeMessage.TopicId, o.LikeMessage.MessageId, o.LikeMessage.UserId)
+		msg, err := n.storage.LikeMessage(o.LikeMessage.TopicId, o.LikeMessage.MessageId, o.LikeMessage.UserId)
 		if err != nil {
-			return err
+			return nil, err
 		}
+		return &pb.MessageEvent{
+			SequenceNumber: op.Sequence,
+			Op:             pb.OpType_OP_LIKE,
+			Message:        msg,
+			EventAt:        timestamppb.Now(),
+			LikerId:        o.LikeMessage.UserId,
+		}, nil
 	case *pb.WriteOp_JoinTopic:
 		err := n.storage.AddTopicParticipant(o.JoinTopic.TopicId, o.JoinTopic.UserId)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
-	return nil
+	return nil, nil
 }
 
-func (n *Node) NotifyEvent(ctx context.Context, event *pb.MessageEvent) (*emptypb.Empty, error) {
-	n.broadcastEvent(event)
-
-	if n.nextNode != "" && n.role != RoleTail {
-		go n.notifyEvent(event)
-	}
-
-	return &emptypb.Empty{}, nil
-}
-
-func (n *Node) AcknowledgeWrite(ctx context.Context, req *pb.AcknowledgeRequest) (*emptypb.Empty, error) {
+func (n *Node) AcknowledgeWrite(_ context.Context, req *pb.AcknowledgeRequest) (*emptypb.Empty, error) {
 	// Persist acknowledgement
 	if err := n.storage.UpdateLastAcked(req.Sequence); err != nil {
 		log.Printf("Failed to persist acknowledgement for seq %d: %v", req.Sequence, err)
@@ -751,6 +756,7 @@ func (n *Node) AcknowledgeWrite(ctx context.Context, req *pb.AcknowledgeRequest)
 
 	if n.role == RoleHead {
 		if exists && ch != nil {
+			// Make this node send a successful response to the client
 			ch <- nil
 		}
 	} else {
@@ -760,7 +766,7 @@ func (n *Node) AcknowledgeWrite(ctx context.Context, req *pb.AcknowledgeRequest)
 	return &emptypb.Empty{}, nil
 }
 
-func (n *Node) GetLastAcked(ctx context.Context, _ *emptypb.Empty) (*pb.GetLastAckedResponse, error) {
+func (n *Node) GetLastAcked(_ context.Context, _ *emptypb.Empty) (*pb.GetLastAckedResponse, error) {
 	seq, err := n.storage.GetLastAcked()
 	if err != nil {
 		return nil, err
@@ -770,9 +776,8 @@ func (n *Node) GetLastAcked(ctx context.Context, _ *emptypb.Empty) (*pb.GetLastA
 
 func (n *Node) runReplicationWorker() {
 	for op := range n.replQueue {
-		// Forward writes sequentially to preserve order
 		if err := n.replicateWrite(context.Background(), op); err != nil {
-			log.Printf("Failed to replicate write (seq %d): %v", op.Sequence, err)
+			log.Printf("Hard failed to replicate write (seq %d): %v", op.Sequence, err)
 		}
 	}
 }
@@ -780,7 +785,7 @@ func (n *Node) runReplicationWorker() {
 func (n *Node) runAckWorker() {
 	for seq := range n.ackQueue {
 		if err := n.acknowledgeWrite(context.Background(), seq); err != nil {
-			log.Printf("Failed to acknowledge write %d: %v", seq, err)
+			log.Printf("Hard failed to acknowledge write %d: %v", seq, err)
 		}
 	}
 }
@@ -875,24 +880,6 @@ func (n *Node) acknowledgeWrite(ctx context.Context, sequence int64) error {
 			// retry
 		}
 	}
-}
-
-func (n *Node) notifyEvent(event *pb.MessageEvent) {
-	if n.nextNode == "" {
-		return
-	}
-
-	conn, err := grpc.NewClient(n.nextNode, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-
-	client := pb.NewReplicationClient(conn)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	client.NotifyEvent(ctx, event)
 }
 
 func (n *Node) broadcastEvent(event *pb.MessageEvent) {
@@ -993,7 +980,8 @@ func (n *Node) SyncWithTail(ctx context.Context) error {
 		}
 		// Apply op
 		log.Printf("Applying %d, %s", op.Sequence, op.Operation)
-		if err := n.applyWriteOp(op); err != nil {
+		_, err = n.applyWriteOp(op)
+		if err != nil {
 			return fmt.Errorf("failed to apply op %d: %v", op.Sequence, err)
 		}
 

@@ -17,7 +17,6 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 var (
@@ -59,15 +58,14 @@ func main() {
 
 	log.Printf("Node %s starting on %s", *nodeID, address)
 
-	// Register with control plane
-	go registerWithControlPlane(*nodeID, address, *controlAddr, node)
-
 	// Start server
 	go func() {
 		if err := grpcServer.Serve(lis); err != nil {
 			log.Fatalf("Failed to serve: %v", err)
 		}
 	}()
+
+	go registerWithControlPlane(*nodeID, address, *controlAddr, node)
 
 	// Wait for interrupt
 	sigCh := make(chan os.Signal, 1)
@@ -79,6 +77,8 @@ func main() {
 }
 
 func registerWithControlPlane(nodeID, address, controlAddr string, node *dataplane.Node) {
+	waitForServer(address)
+
 	conn, err := grpc.NewClient(controlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Printf("Failed to connect to control plane: %v", err)
@@ -86,13 +86,13 @@ func registerWithControlPlane(nodeID, address, controlAddr string, node *datapla
 	}
 	defer conn.Close()
 
-	client := pb.NewControlPlaneClient(conn)
+	controlPlaneClient := pb.NewControlPlaneClient(conn)
 
 	// Register
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	_, err = client.RegisterNode(ctx, &pb.RegisterNodeRequest{
+	_, err = controlPlaneClient.RegisterNode(ctx, &pb.RegisterNodeRequest{
 		NodeId:  nodeID,
 		Address: address,
 	})
@@ -103,115 +103,59 @@ func registerWithControlPlane(nodeID, address, controlAddr string, node *datapla
 
 	log.Printf("Registered with control plane")
 
+	// Sync with tail
+	hasSynced := false
+	ticker := time.NewTicker(3 * time.Second)
+
+	syncFunc := func() {
+		log.Printf("Initiating sync with tail")
+		// Use a longer timeout for sync
+		syncCtx, syncCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := node.SyncWithTail(syncCtx); err != nil {
+			log.Printf("Sync failed: %v", err)
+			syncCancel()
+		}
+		syncCancel()
+		hasSynced = true
+	}
+
+	syncFunc()
+	for range ticker.C {
+		if hasSynced {
+			break
+		}
+		syncFunc()
+	}
+
 	// Send heartbeats
-	ticker := time.NewTicker(5 * time.Second)
+	ticker = time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
-	hasSynced := false
-
-	heartbeat := func() {
+	heartbeatFunc := func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		_, err := client.Heartbeat(ctx, &pb.HeartbeatRequest{NodeId: nodeID})
+		_, err := controlPlaneClient.Heartbeat(ctx, &pb.HeartbeatRequest{NodeId: nodeID})
 		cancel()
 
 		if err != nil {
 			log.Printf("Heartbeat failed: %v", err)
 		}
-
-		// Get and update role
-		if hasSynced {
-			_, err := updateRole(client, node)
-			if err != nil {
-				log.Printf("Failed to update role: %v", err)
-				return
-			}
-		}
-
-		if !hasSynced {
-			log.Printf("Initiating sync with tail")
-			// Use a longer timeout for sync
-			syncCtx, syncCancel := context.WithTimeout(context.Background(), 30*time.Second)
-			if err := node.SyncWithTail(syncCtx); err != nil {
-				log.Printf("Sync failed: %v", err)
-				syncCancel()
-				return // Retry next tick
-			}
-			syncCancel()
-			hasSynced = true
-			log.Printf("Sync completed successfully")
-
-			_, err := updateRole(client, node)
-			if err != nil {
-				log.Printf("Failed to update role: %v", err)
-				return
-			}
-		}
 	}
 
-	heartbeat()
+	heartbeatFunc()
 
 	for range ticker.C {
-		heartbeat()
+		heartbeatFunc()
 	}
 }
 
-func updateRole(client pb.ControlPlaneClient, node *dataplane.Node) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
+func waitForServer(address string) error {
+	for {
+		conn, err := grpc.NewClient(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err == nil {
+			conn.Close()
+			return nil
+		}
 
-	state, err := client.GetClusterState(ctx, &emptypb.Empty{})
-	if err != nil {
-		return "", err
+		time.Sleep(100 * time.Millisecond)
 	}
-
-	var prevNode string
-	var nextNode string
-	var role dataplane.NodeRole
-
-	// Determine role
-	if state.Head.NodeId == node.NodeID() {
-		chainState, err := client.GetChainState(ctx, &emptypb.Empty{})
-		if err != nil {
-			return "", err
-		}
-
-		if len(chainState.Chain) > 1 {
-			nextNode = chainState.Chain[1].Address
-		}
-		role = dataplane.RoleHead
-		prevNode = ""
-	} else if state.Tail.NodeId == node.NodeID() {
-		chainState, err := client.GetChainState(ctx, &emptypb.Empty{})
-		if err != nil {
-			return "", err
-		}
-
-		if len(chainState.Chain) > 1 {
-			prevNode = chainState.Chain[len(chainState.Chain)-2].Address
-		}
-		role = dataplane.RoleTail
-		nextNode = ""
-	} else {
-		// Find next node in chain
-		chainState, err := client.GetChainState(ctx, &emptypb.Empty{})
-		if err != nil {
-			return "", err
-		}
-
-		for i, n := range chainState.Chain {
-			if n.NodeId == node.NodeID() {
-				if i < len(chainState.Chain)-1 {
-					nextNode = chainState.Chain[i+1].Address
-				}
-				if i > 0 {
-					prevNode = chainState.Chain[i-1].Address
-				}
-				break
-			}
-		}
-		role = dataplane.RoleMiddle
-	}
-
-	node.SetRole(role, nextNode, prevNode)
-	return prevNode, nil
 }
