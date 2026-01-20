@@ -9,6 +9,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	pb "messageboard/proto"
@@ -33,6 +34,7 @@ type Node struct {
 
 	nodeID      string
 	address     string
+	testing     bool
 	storage     *Storage
 	role        NodeRole
 	nextNode    string // address of next node in chain
@@ -59,6 +61,9 @@ type Node struct {
 
 	// Ack queue ensures acknowledgements are forwarded in order
 	ackQueue chan int64
+
+	// Round robin index for subscription load balancing
+	rrIndex uint64
 }
 
 type Subscription struct {
@@ -68,7 +73,7 @@ type Subscription struct {
 	EventChan     chan *pb.MessageEvent
 }
 
-func NewNode(nodeID, address, dbPath, controlAddr string) (*Node, error) {
+func NewNode(nodeID, address, dbPath, controlAddr string, testing bool) (*Node, error) {
 	storage, err := NewStorage(dbPath)
 	if err != nil {
 		return nil, err
@@ -78,6 +83,7 @@ func NewNode(nodeID, address, dbPath, controlAddr string) (*Node, error) {
 		nodeID:        nodeID,
 		address:       address,
 		storage:       storage,
+		testing:       testing,
 		subscriptions: make(map[string]*Subscription),
 		controlAddr:   controlAddr,
 		pendingWrites: make(map[int64]chan error),
@@ -101,13 +107,66 @@ func (n *Node) SetControlPlaneClient(client pb.ControlPlaneClient) {
 func (n *Node) SetRole(role NodeRole, nextNode, prevNode string) {
 	n.topologyMu.Lock()
 	defer n.topologyMu.Unlock()
+
+	//changedNextNode := n.nextNode != nextNode
+	changedPrevNode := n.prevNode != prevNode
 	if n.role == role && n.nextNode == nextNode && n.prevNode == prevNode {
 		return
 	}
+
 	n.role = role
 	n.nextNode = nextNode
 	n.prevNode = prevNode
-	log.Printf("Node %s role set to %v, next node: %s, prev node: %s", n.nodeID, role, nextNode, prevNode)
+	log.Printf("Node %s role set to %v, next node: %s, prev node: %s", n.nodeID, n.role, n.nextNode, n.prevNode)
+
+	lastSeq := n.storage.GetLastSequence()
+	lastAck, _ := n.storage.GetLastAcked()
+	if n.role == RoleTail {
+		// The old tail may have not sent us all ACKs yet, so generate the latest ACK here.
+		log.Printf("Role changed to tail, sending %d as last ACK", lastSeq)
+		if err := n.storage.UpdateLastAcked(lastSeq); err != nil {
+			log.Printf("Failed to update last acked: %v", err)
+		}
+		n.ackQueue <- lastSeq
+	}
+
+	if changedPrevNode && n.prevNode != "" {
+		n.ackQueue <- lastAck
+
+		// Stream operation from lastSeq+1
+		conn, err := grpc.NewClient(n.prevNode, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			// TODO: handle error
+			return
+		}
+		defer conn.Close()
+		prevNodeClient := pb.NewReplicationClient(conn)
+		stream, err := prevNodeClient.StreamLog(context.Background(), &pb.StreamLogRequest{FromSequence: lastSeq + 1})
+		if err != nil {
+			// TODO: handle error
+			return
+		}
+
+		for {
+			op, err := stream.Recv()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				// TODO: handle error
+				// stream error
+				return
+			}
+			// Apply op
+			log.Printf("Applying %d, %s", op.Sequence, op.Operation)
+			_, err = n.applyWriteOp(op)
+			if err != nil {
+				//return fmt.Errorf("failed to apply op %d: %v", op.Sequence, err)
+				// TODO: handle error
+				// No return here, because this might happen if we applied a duplicate
+			}
+		}
+	}
 }
 
 func (n *Node) checkSyncing() error {
@@ -120,7 +179,7 @@ func (n *Node) checkSyncing() error {
 }
 
 func (n *Node) NotifyStateChange(_ context.Context, req *pb.StateChangeNotification) (*emptypb.Empty, error) {
-	log.Printf("Received state change: prevNode=%s, nextNode=%s, isHead=%v, isTail=%v", req.PrevNode, req.NextNode, req.IsHead, req.IsTail)
+	log.Printf("Node %s received state change: prevNode=%s, nextNode=%s, isHead=%v, isTail=%v", n.nodeID, req.PrevNode, req.NextNode, req.IsHead, req.IsTail)
 
 	prevNode := req.PrevNode
 	nextNode := req.NextNode
@@ -658,7 +717,7 @@ func (n *Node) GetMessagesByUser(ctx context.Context, req *pb.GetMessagesByUserR
 }
 
 // Subscription handling
-func (n *Node) GetSubscriptionNode(_ context.Context, _ *pb.SubscriptionNodeRequest) (*pb.SubscriptionNodeResponse, error) {
+func (n *Node) GetSubscriptionNode(ctx context.Context, _ *pb.SubscriptionNodeRequest) (*pb.SubscriptionNodeResponse, error) {
 	if err := n.checkSyncing(); err != nil {
 		return nil, err
 	}
@@ -666,15 +725,33 @@ func (n *Node) GetSubscriptionNode(_ context.Context, _ *pb.SubscriptionNodeRequ
 		return nil, fmt.Errorf("not the head node")
 	}
 
+	n.cpClientMu.RLock()
+	cpClient := n.cpClient
+	n.cpClientMu.RUnlock()
+
+	if cpClient == nil {
+		return nil, fmt.Errorf("control plane client not set")
+	}
+
+	chainState, err := cpClient.GetChainState(ctx, &emptypb.Empty{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get chain state: %v", err)
+	}
+
+	chain := chainState.Chain
+	if len(chain) == 0 {
+		return nil, fmt.Errorf("chain is empty")
+	}
+
+	// Simple round-robin load balancing
+	idx := atomic.AddUint64(&n.rrIndex, 1)
+	selectedNode := chain[idx%uint64(len(chain))]
+
 	token := generateToken()
 
-	// Simple round-robin load balancing - assign to self for now
 	return &pb.SubscriptionNodeResponse{
 		SubscribeToken: token,
-		Node: &pb.NodeInfo{
-			NodeId:  n.nodeID,
-			Address: n.address,
-		},
+		Node:           selectedNode,
 	}, nil
 }
 
@@ -703,6 +780,7 @@ func (n *Node) SubscribeTopic(req *pb.SubscribeTopicRequest, stream pb.MessageBo
 
 	// Send historical messages
 	for _, topicID := range sub.TopicIDs {
+		log.Printf("Subscribing on topic id %d", topicID)
 		messages, err := n.storage.GetMessages(topicID, sub.FromMessageID, 1000, req.UserId)
 		if err != nil {
 			continue
@@ -734,6 +812,20 @@ func (n *Node) SubscribeTopic(req *pb.SubscribeTopicRequest, stream pb.MessageBo
 // Replication
 func (n *Node) ReplicateWrite(_ context.Context, req *pb.ReplicationRequest) (*emptypb.Empty, error) {
 	op := req.Op
+
+	// If testing is enabled and this is node4, check if we should freeze
+	if n.testing && n.nodeID == "node4" {
+		if op.Operation != nil {
+			if postMsg, ok := op.Operation.(*pb.WriteOp_PostMessage); ok {
+				if postMsg.PostMessage.Text == "node4freeze" {
+					log.Printf("Node %s freezing on message 'node4freeze'", n.nodeID)
+					// Freeze indefinitely (or until killed)
+					select {}
+				}
+			}
+		}
+	}
+
 	event, err := n.applyWriteOp(op)
 	if err != nil {
 		return nil, err
@@ -763,6 +855,8 @@ func (n *Node) applyWriteOp(op *pb.WriteOp) (*pb.MessageEvent, error) {
 	if _, err := n.storage.LogOperation(op); err != nil {
 		return nil, err
 	}
+
+	// TODO: if the operation is a duplicate, return nil, nil here
 
 	switch o := op.Operation.(type) {
 	case *pb.WriteOp_CreateUser:
@@ -850,6 +944,11 @@ func (n *Node) GetLastAcked(_ context.Context, _ *emptypb.Empty) (*pb.GetLastAck
 	return &pb.GetLastAckedResponse{Sequence: seq}, nil
 }
 
+func (n *Node) GetLastSequence(_ context.Context, _ *emptypb.Empty) (*pb.GetLastSequenceResponse, error) {
+	seq := n.storage.GetLastSequence()
+	return &pb.GetLastSequenceResponse{Sequence: seq}, nil
+}
+
 func (n *Node) runReplicationWorker() {
 	for op := range n.replQueue {
 		if err := n.replicateWrite(context.Background(), op); err != nil {
@@ -881,6 +980,8 @@ func (n *Node) replicateWrite(ctx context.Context, op *pb.WriteOp) error {
 		if next == "" {
 			return nil
 		}
+
+		log.Printf("Sending replicate write (seq %d) from %s to %s", op.Sequence, n.nodeID, next)
 
 		err := func() error {
 			conn, err := grpc.NewClient(next, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -927,6 +1028,8 @@ func (n *Node) acknowledgeWrite(ctx context.Context, sequence int64) error {
 		if prev == "" {
 			return nil
 		}
+
+		log.Printf("Sending ACK %d from %s to %s", sequence, n.nodeID, prev)
 
 		err := func() error {
 			conn, err := grpc.NewClient(prev, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -1034,40 +1137,73 @@ func (n *Node) SyncWithTail(ctx context.Context) error {
 	defer conn.Close()
 	client := pb.NewReplicationClient(conn)
 
-	// Get local last sequence
-	lastSeq := n.storage.GetLastSequence()
-	log.Printf("Local last sequence: %d", lastSeq)
-
-	// Stream Log
-	stream, err := client.StreamLog(ctx, &pb.StreamLogRequest{FromSequence: lastSeq + 1})
-	if err != nil {
-		return fmt.Errorf("failed to start log stream: %v", err)
-	}
-
-	log.Printf("Streaming log from sequence %d", lastSeq+1)
-
-	for {
-		op, err := stream.Recv()
-		if err == io.EOF {
-			break
+	// Retry only happens when there is a sequence number mismatch. Other failures fail immediately.
+	const maxRetries = 5
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			log.Printf("Retry attempt %d/%d after sequence mismatch", attempt, maxRetries)
 		}
+
+		// Get local last sequence
+		lastSeq := n.storage.GetLastSequence()
+		log.Printf("Local last sequence: %d", lastSeq)
+
+		// Stream Log
+		stream, err := client.StreamLog(ctx, &pb.StreamLogRequest{FromSequence: lastSeq + 1})
 		if err != nil {
-			return fmt.Errorf("stream error: %v", err)
+			return fmt.Errorf("failed to start log stream: %v", err)
 		}
-		// Apply op
-		log.Printf("Applying %d, %s", op.Sequence, op.Operation)
-		_, err = n.applyWriteOp(op)
+
+		if n.testing && n.nodeID == "node4" && attempt == 0 {
+			log.Printf("Node %s is artificially waiting", n.nodeID)
+			time.Sleep(2 * time.Second)
+		}
+
+		log.Printf("Streaming log from sequence %d", lastSeq+1)
+
+		for {
+			op, err := stream.Recv()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return fmt.Errorf("stream error: %v", err)
+			}
+			// Apply op
+			log.Printf("Applying %d, %s", op.Sequence, op.Operation)
+			_, err = n.applyWriteOp(op)
+			if err != nil {
+				return fmt.Errorf("failed to apply op %d: %v", op.Sequence, err)
+			}
+
+			// Update last acked sequence since we received it from tail
+			if err := n.storage.UpdateLastAcked(op.Sequence); err != nil {
+				log.Printf("Failed to update last acked during sync: %v", err)
+			}
+		}
+
+		log.Printf("Sync completed, verifying sequence numbers...")
+
+		tailLastSeqResponse, err := client.GetLastSequence(ctx, &emptypb.Empty{})
+
 		if err != nil {
-			return fmt.Errorf("failed to apply op %d: %v", op.Sequence, err)
+			return fmt.Errorf("failed to get tail state: %v", err)
 		}
 
-		// Update last acked sequence since we received it from tail
-		if err := n.storage.UpdateLastAcked(op.Sequence); err != nil {
-			log.Printf("Failed to update last acked during sync: %v", err)
+		tailLastSeq := tailLastSeqResponse.Sequence
+		localLastSeq := n.storage.GetLastSequence()
+		if localLastSeq != tailLastSeq {
+			if attempt == maxRetries-1 {
+				return fmt.Errorf("sequence number mismatch: local sequence %d != tail sequence %d", localLastSeq, tailLastSeq)
+			}
+
+			log.Printf("Sequence number mismatch: local sequence %d != tail sequence %d", localLastSeq, tailLastSeq)
+			continue
 		}
+
+		log.Printf("Sequence numbers match, confirming sync...")
+		break
 	}
-
-	log.Printf("Sync completed")
 
 	// Confirm Synced
 	_, err = cpClient.ConfirmSynced(ctx, &pb.ConfirmSyncedRequest{NodeId: n.nodeID})
@@ -1087,9 +1223,9 @@ func (n *Node) NodeID() string {
 }
 
 func (n *Node) hasPendingWrites() bool {
-	n.pendingMu.RLock()
-	defer n.pendingMu.RUnlock()
-	return len(n.pendingWrites) > 0
+	lastSeq := n.storage.GetLastSequence()
+	lastAck, _ := n.storage.GetLastAcked()
+	return lastSeq > lastAck
 }
 
 // Forwarding methods

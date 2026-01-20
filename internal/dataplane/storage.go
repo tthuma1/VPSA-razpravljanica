@@ -639,7 +639,10 @@ func (s *Storage) GetLastSequence() int64 {
 	defer s.mu.RUnlock()
 
 	var seq int64
-	s.db.QueryRow("SELECT last_seq FROM sequence WHERE id = 1").Scan(&seq)
+	err := s.db.QueryRow("SELECT last_seq FROM sequence WHERE id = 1").Scan(&seq)
+	if err != nil {
+		return 0
+	}
 	return seq
 }
 
@@ -721,14 +724,15 @@ func (s *Storage) LogOperation(op *pb.WriteOp) (int64, error) {
 		var exists int
 		s.db.QueryRow("SELECT COUNT(*) FROM operation_log WHERE sequence_id = ?", op.Sequence).Scan(&exists)
 		if exists > 0 {
-			return op.Sequence, nil // Already logged, treat as success
+			// TODO: return error and applyWriteOp do nothing if we get a duplicate
+			return op.Sequence, nil // Already logged
 		}
 
 		// Check for gaps
 		var lastSeq int64
 		s.db.QueryRow("SELECT last_seq FROM sequence WHERE id = 1").Scan(&lastSeq)
 		if op.Sequence > lastSeq+1 {
-			log.Printf("ERROR: Sequence gap detected! Received %d, expected %d", op.Sequence, lastSeq+1)
+			return 0, fmt.Errorf("sequence gap detected! Received %d, expected %d", op.Sequence, lastSeq+1)
 		}
 
 		// Update local sequence tracker

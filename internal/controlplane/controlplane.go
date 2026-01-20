@@ -54,7 +54,7 @@ func NewControlPlane() *ControlPlane {
 		nodes:            make(map[string]*NodeState),
 		chain:            make([]*pb.NodeInfo, 0),
 		lastHeartbeats:   make(map[string]time.Time),
-		heartbeatTimeout: 15 * time.Second,
+		heartbeatTimeout: 6 * time.Second,
 		nodeClients:      make(map[string]pb.MessageBoardClient),
 		nodeConns:        make(map[string]*grpc.ClientConn),
 		leadershipCh:     make(chan bool, 1),
@@ -142,7 +142,7 @@ func (cp *ControlPlane) reconcileRaftPeers() {
 }
 
 func (cp *ControlPlane) monitorDataPlaneHealth() {
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
 	for range ticker.C {
@@ -249,10 +249,6 @@ func (cp *ControlPlane) RegisterNode(_ context.Context, req *pb.RegisterNodeRequ
 	if err := f.Error(); err != nil {
 		return nil, fmt.Errorf("raft apply failed: %v", err)
 	}
-
-	cp.mu.RLock()
-	defer cp.mu.RUnlock()
-	cp.notifyAllNodes()
 
 	return &emptypb.Empty{}, nil
 }
@@ -370,6 +366,8 @@ func (cp *ControlPlane) applyConfirmSynced(nodeID string) {
 	if state, exists := cp.nodes[nodeID]; exists {
 		state.Syncing = false
 		log.Printf("Node %s confirmed synced", nodeID)
+		cp.logReconfiguration()
+		cp.notifyAllNodes() // It would be better to only notify the tail, but this is easier to write.
 	}
 }
 
@@ -411,17 +409,25 @@ func (cp *ControlPlane) logReconfiguration() {
 		if i == len(cp.chain)-1 {
 			role = "TAIL"
 		}
+
+		prevAddr := ""
+		if i > 0 {
+			prevAddr = cp.chain[i-1].Address
+		}
+
 		nextAddr := ""
 		if i < len(cp.chain)-1 {
 			nextAddr = cp.chain[i+1].Address
 		}
-		log.Printf("  [%d] %s (%s) -> %s, next: %s", i, node.NodeId, node.Address, role, nextAddr)
+
+		log.Printf("  [%d] %s (%s) -> %s, prev: %s, next: %s", i, node.NodeId, node.Address, role, prevAddr, nextAddr)
 	}
 }
 
 func (cp *ControlPlane) notifyAllNodes() {
 	for i, node := range cp.chain {
-		var prevNode, nextNode string
+		prevNode, nextNode := "", ""
+
 		if i > 0 {
 			prevNode = cp.chain[i-1].Address
 		}

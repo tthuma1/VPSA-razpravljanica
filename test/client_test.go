@@ -25,20 +25,22 @@ func (m *MockControlPlane) GetChainState(ctx context.Context, _ *emptypb.Empty) 
 // MockMessageBoard implements pb.MessageBoardServer
 type MockMessageBoard struct {
 	pb.UnimplementedMessageBoardServer
-	users    map[string]*pb.User
-	topics   map[string]*pb.Topic
-	messages []*pb.Message
-	likes    map[int64]int32
-	address  string
+	users             map[string]*pb.User
+	topics            map[string]*pb.Topic
+	topicParticipants map[int64]map[int64]bool // topicId -> userId -> bool
+	messages          []*pb.Message
+	likes             map[int64]int32
+	address           string
 }
 
 func NewMockMessageBoard(address string) *MockMessageBoard {
 	return &MockMessageBoard{
-		users:    make(map[string]*pb.User),
-		topics:   make(map[string]*pb.Topic),
-		messages: make([]*pb.Message, 0),
-		likes:    make(map[int64]int32),
-		address:  address,
+		users:             make(map[string]*pb.User),
+		topics:            make(map[string]*pb.Topic),
+		topicParticipants: make(map[int64]map[int64]bool),
+		messages:          make([]*pb.Message, 0),
+		likes:             make(map[int64]int32),
+		address:           address,
 	}
 }
 
@@ -71,6 +73,13 @@ func (m *MockMessageBoard) CreateTopic(ctx context.Context, req *pb.CreateTopicR
 		Name: req.Name,
 	}
 	m.topics[req.Name] = topic
+
+	// Auto-join creator
+	if m.topicParticipants[topic.Id] == nil {
+		m.topicParticipants[topic.Id] = make(map[int64]bool)
+	}
+	m.topicParticipants[topic.Id][req.UserId] = true
+
 	return topic, nil
 }
 
@@ -82,12 +91,60 @@ func (m *MockMessageBoard) GetTopic(ctx context.Context, req *pb.GetTopicRequest
 	return topic, nil
 }
 
-func (m *MockMessageBoard) ListTopics(ctx context.Context, _ *emptypb.Empty) (*pb.ListTopicsResponse, error) {
+func (m *MockMessageBoard) ListTopics(ctx context.Context, req *pb.ListTopicsRequest) (*pb.ListTopicsResponse, error) {
+	topics := make([]*pb.Topic, 0)
+	for _, t := range m.topics {
+		if participants, ok := m.topicParticipants[t.Id]; ok {
+			if participants[req.UserId] {
+				topics = append(topics, t)
+			}
+		}
+	}
+	return &pb.ListTopicsResponse{Topics: topics}, nil
+}
+
+func (m *MockMessageBoard) ListAllTopics(ctx context.Context, _ *emptypb.Empty) (*pb.ListTopicsResponse, error) {
 	topics := make([]*pb.Topic, 0, len(m.topics))
 	for _, t := range m.topics {
 		topics = append(topics, t)
 	}
 	return &pb.ListTopicsResponse{Topics: topics}, nil
+}
+
+func (m *MockMessageBoard) ListJoinableTopics(ctx context.Context, req *pb.ListJoinableTopicsRequest) (*pb.ListTopicsResponse, error) {
+	topics := make([]*pb.Topic, 0)
+	for _, t := range m.topics {
+		joined := false
+		if participants, ok := m.topicParticipants[t.Id]; ok {
+			if participants[req.UserId] {
+				joined = true
+			}
+		}
+		if !joined {
+			topics = append(topics, t)
+		}
+	}
+	return &pb.ListTopicsResponse{Topics: topics}, nil
+}
+
+func (m *MockMessageBoard) JoinTopic(ctx context.Context, req *pb.JoinTopicRequest) (*emptypb.Empty, error) {
+	var topicId int64 = -1
+	for _, t := range m.topics {
+		if t.Id == req.TopicId {
+			topicId = t.Id
+			break
+		}
+	}
+
+	if topicId == -1 {
+		return nil, fmt.Errorf("topic not found")
+	}
+
+	if m.topicParticipants[req.TopicId] == nil {
+		m.topicParticipants[req.TopicId] = make(map[int64]bool)
+	}
+	m.topicParticipants[req.TopicId][req.UserId] = true
+	return &emptypb.Empty{}, nil
 }
 
 func (m *MockMessageBoard) PostMessage(ctx context.Context, req *pb.PostMessageRequest) (*pb.Message, error) {

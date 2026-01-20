@@ -27,6 +27,8 @@ var (
 	nodeID      = flag.String("id", "", "Node ID")
 	dbPath      = flag.String("db", "", "Database path")
 	controlAddr = flag.String("control", "localhost:50051,localhost:50052,localhost:50053", "Comma-separated list of Control plane addresses")
+
+	testing = flag.Bool("testing", false, "Set this flag to trigger various sleeps during execution")
 )
 
 func main() {
@@ -42,7 +44,8 @@ func main() {
 
 	address := fmt.Sprintf("localhost:%d", *port)
 
-	node, err := dataplane.NewNode(*nodeID, address, *dbPath, *controlAddr)
+	// Create node
+	node, err := dataplane.NewNode(*nodeID, address, *dbPath, *controlAddr, *testing)
 	if err != nil {
 		log.Fatalf("Failed to create node: %v", err)
 	}
@@ -88,16 +91,16 @@ func registerWithControlPlane(nodeID, address, controlAddrsStr string, node *dat
 		mu.Lock()
 		defer mu.Unlock()
 
-		for _, addr := range controlAddrs {
-			var tempConn *grpc.ClientConn
-			tempConn, err = grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		for _, cpAddr := range controlAddrs {
+			var cpClientConn *grpc.ClientConn
+			cpClientConn, err = grpc.NewClient(cpAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 			if err != nil {
 				continue
 			}
-			client := pb.NewControlPlaneClient(tempConn)
+			cpClient := pb.NewControlPlaneClient(cpClientConn)
 
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			_, err = client.RegisterNode(ctx, &pb.RegisterNodeRequest{
+			_, err = cpClient.RegisterNode(ctx, &pb.RegisterNodeRequest{
 				NodeId:  nodeID,
 				Address: address,
 			})
@@ -107,14 +110,14 @@ func registerWithControlPlane(nodeID, address, controlAddrsStr string, node *dat
 				if conn != nil {
 					conn.Close()
 				}
-				conn = tempConn
-				controlPlaneClient = client
-				log.Printf("Registered with control plane at %s", addr)
+				conn = cpClientConn
+				controlPlaneClient = cpClient
+				log.Printf("Registered with control plane at %s", cpAddr)
 				return nil
 			}
 
 			if leaderAddr := parseLeaderRedirect(err); leaderAddr != "" {
-				tempConn.Close() // Close connection to follower
+				cpClientConn.Close() // Close connection to follower
 				log.Printf("Redirecting to leader at %s", leaderAddr)
 
 				if conn != nil {
@@ -122,21 +125,21 @@ func registerWithControlPlane(nodeID, address, controlAddrsStr string, node *dat
 				}
 				conn, err = grpc.NewClient(leaderAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 				if err == nil {
-					client = pb.NewControlPlaneClient(conn)
+					cpClient = pb.NewControlPlaneClient(conn)
 					ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-					_, err = client.RegisterNode(ctx, &pb.RegisterNodeRequest{
+					_, err = cpClient.RegisterNode(ctx, &pb.RegisterNodeRequest{
 						NodeId:  nodeID,
 						Address: address,
 					})
 					cancel()
 					if err == nil {
-						controlPlaneClient = client
+						controlPlaneClient = cpClient
 						log.Printf("Registered with control plane leader at %s", leaderAddr)
 						return nil
 					}
 				}
 			}
-			tempConn.Close()
+			cpClientConn.Close()
 		}
 		return fmt.Errorf("failed to register with any control plane node")
 	}
@@ -173,7 +176,7 @@ func registerWithControlPlane(nodeID, address, controlAddrsStr string, node *dat
 	}
 
 	// Send heartbeats
-	heartbeatTicker := time.NewTicker(3 * time.Second)
+	heartbeatTicker := time.NewTicker(2 * time.Second)
 	defer heartbeatTicker.Stop()
 
 	heartbeatFunc := func() {
