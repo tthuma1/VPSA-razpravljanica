@@ -24,6 +24,8 @@ var (
 	nodeID      = flag.String("id", "", "Node ID")
 	dbPath      = flag.String("db", "", "Database path")
 	controlAddr = flag.String("control", "localhost:50050", "Control plane address")
+
+	testing = flag.Bool("testing", false, "Set this flag to trigger various sleeps during execution")
 )
 
 func main() {
@@ -40,7 +42,7 @@ func main() {
 	address := fmt.Sprintf("localhost:%d", *port)
 
 	// Create node
-	node, err := dataplane.NewNode(*nodeID, address, *dbPath, *controlAddr)
+	node, err := dataplane.NewNode(*nodeID, address, *dbPath, *controlAddr, *testing)
 	if err != nil {
 		log.Fatalf("Failed to create node: %v", err)
 	}
@@ -128,7 +130,7 @@ func registerWithControlPlane(nodeID, address, controlAddr string, node *datapla
 	}
 
 	// Send heartbeats
-	ticker = time.NewTicker(3 * time.Second)
+	ticker = time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
 	heartbeatFunc := func() {

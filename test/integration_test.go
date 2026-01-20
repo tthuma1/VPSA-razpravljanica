@@ -37,11 +37,11 @@ func startControlPlane(t *testing.T, port int) (*grpc.Server, string) {
 }
 
 // Improved node starter that returns a stop function
-func startNodeWithStopper(t *testing.T, id string, port int, controlAddr string, dbPath string) (*grpc.Server, *dataplane.Node, func()) {
+func startNodeWithStopper(t *testing.T, id string, port int, controlAddr string, dbPath string, testing bool) (*grpc.Server, *dataplane.Node, func()) {
 	// Clean up DB if exists
 	os.Remove(dbPath)
 
-	node, err := dataplane.NewNode(id, fmt.Sprintf("localhost:%d", port), dbPath, controlAddr)
+	node, err := dataplane.NewNode(id, fmt.Sprintf("localhost:%d", port), dbPath, controlAddr, testing)
 	if err != nil {
 		t.Fatalf("failed to create node: %v", err)
 	}
@@ -157,7 +157,7 @@ func TestIntegrationScenario(t *testing.T) {
 
 	// 2. Start 3 Nodes
 	// Node 1 (Head initially)
-	_, _, stop1 := startNodeWithStopper(t, "node1", 50061, cpAddr, "test_node1.db")
+	_, _, stop1 := startNodeWithStopper(t, "node1", 50061, cpAddr, "test_node1.db", false)
 	defer func() {
 		os.Remove("test_node1.db")
 		// stop1() // Don't call stop1 here, we call it manually in the test
@@ -167,7 +167,7 @@ func TestIntegrationScenario(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	// Node 2
-	_, _, stop2 := startNodeWithStopper(t, "node2", 50062, cpAddr, "test_node2.db")
+	_, _, stop2 := startNodeWithStopper(t, "node2", 50062, cpAddr, "test_node2.db", false)
 	defer func() {
 		os.Remove("test_node2.db")
 		//stop2()
@@ -176,7 +176,7 @@ func TestIntegrationScenario(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	// Node 3 (Tail initially)
-	_, _, stop3 := startNodeWithStopper(t, "node3", 50063, cpAddr, "test_node3.db")
+	_, _, stop3 := startNodeWithStopper(t, "node3", 50063, cpAddr, "test_node3.db", false)
 	defer func() {
 		os.Remove("test_node3.db")
 		//stop3()
@@ -274,7 +274,7 @@ func TestIntegrationScenario(t *testing.T) {
 
 	// For this test, let's assume it comes back as a fresh node (or with cleared state) and syncs from others.
 	// This is safer for consistency.
-	_, _, stop1New := startNodeWithStopper(t, "node1", 50061, cpAddr, "test_node1_recovered.db")
+	_, _, stop1New := startNodeWithStopper(t, "node1", 50061, cpAddr, "test_node1_recovered.db", false)
 	defer func() {
 		os.Remove("test_node1_recovered.db")
 		stop1New()

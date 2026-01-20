@@ -32,6 +32,7 @@ type Node struct {
 
 	nodeID      string
 	address     string
+	testing     bool
 	storage     *Storage
 	role        NodeRole
 	nextNode    string // address of next node in chain
@@ -65,7 +66,7 @@ type Subscription struct {
 	EventChan     chan *pb.MessageEvent
 }
 
-func NewNode(nodeID, address, dbPath, controlAddr string) (*Node, error) {
+func NewNode(nodeID, address, dbPath, controlAddr string, testing bool) (*Node, error) {
 	storage, err := NewStorage(dbPath)
 	if err != nil {
 		return nil, err
@@ -75,6 +76,7 @@ func NewNode(nodeID, address, dbPath, controlAddr string) (*Node, error) {
 		nodeID:        nodeID,
 		address:       address,
 		storage:       storage,
+		testing:       testing,
 		subscriptions: make(map[string]*Subscription),
 		controlAddr:   controlAddr,
 		pendingWrites: make(map[int64]chan error),
@@ -963,55 +965,73 @@ func (n *Node) SyncWithTail(ctx context.Context) error {
 	defer conn.Close()
 	client := pb.NewReplicationClient(conn)
 
-	// Get local last sequence
-	lastSeq := n.storage.GetLastSequence()
-	log.Printf("Local last sequence: %d", lastSeq)
-
-	// Stream Log
-	stream, err := client.StreamLog(ctx, &pb.StreamLogRequest{FromSequence: lastSeq + 1})
-	if err != nil {
-		return fmt.Errorf("failed to start log stream: %v", err)
-	}
-
-	log.Printf("Streaming log from sequence %d", lastSeq+1)
-
-	for {
-		op, err := stream.Recv()
-		if err == io.EOF {
-			break
+	// Retry only happens when there is a sequence number mismatch. Other failures fail immediately.
+	const maxRetries = 5
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			log.Printf("Retry attempt %d/%d after sequence mismatch", attempt, maxRetries)
 		}
+
+		// Get local last sequence
+		lastSeq := n.storage.GetLastSequence()
+		log.Printf("Local last sequence: %d", lastSeq)
+
+		// Stream Log
+		stream, err := client.StreamLog(ctx, &pb.StreamLogRequest{FromSequence: lastSeq + 1})
 		if err != nil {
-			return fmt.Errorf("stream error: %v", err)
+			return fmt.Errorf("failed to start log stream: %v", err)
 		}
-		// Apply op
-		log.Printf("Applying %d, %s", op.Sequence, op.Operation)
-		_, err = n.applyWriteOp(op)
+
+		if n.testing && n.nodeID == "node4" && attempt == 0 {
+			log.Printf("Node %s is artificially waiting", n.nodeID)
+			time.Sleep(2 * time.Second)
+		}
+
+		log.Printf("Streaming log from sequence %d", lastSeq+1)
+
+		for {
+			op, err := stream.Recv()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return fmt.Errorf("stream error: %v", err)
+			}
+			// Apply op
+			log.Printf("Applying %d, %s", op.Sequence, op.Operation)
+			_, err = n.applyWriteOp(op)
+			if err != nil {
+				return fmt.Errorf("failed to apply op %d: %v", op.Sequence, err)
+			}
+
+			// Update last acked sequence since we received it from tail
+			if err := n.storage.UpdateLastAcked(op.Sequence); err != nil {
+				log.Printf("Failed to update last acked during sync: %v", err)
+			}
+		}
+
+		log.Printf("Sync completed, verifying sequence numbers...")
+
+		tailLastSeqResponse, err := client.GetLastSequence(ctx, &emptypb.Empty{})
+
 		if err != nil {
-			return fmt.Errorf("failed to apply op %d: %v", op.Sequence, err)
+			return fmt.Errorf("failed to get tail state: %v", err)
 		}
 
-		// Update last acked sequence since we received it from tail
-		if err := n.storage.UpdateLastAcked(op.Sequence); err != nil {
-			log.Printf("Failed to update last acked during sync: %v", err)
+		tailLastSeq := tailLastSeqResponse.Sequence
+		localLastSeq := n.storage.GetLastSequence()
+		if localLastSeq != tailLastSeq {
+			if attempt == maxRetries-1 {
+				return fmt.Errorf("sequence number mismatch: local sequence %d != tail sequence %d", localLastSeq, tailLastSeq)
+			}
+
+			log.Printf("Sequence number mismatch: local sequence %d != tail sequence %d", localLastSeq, tailLastSeq)
+			continue
 		}
+
+		log.Printf("Sequence numbers match, confirming sync...")
+		break
 	}
-
-	log.Printf("Sync completed, verifying sequence numbers...")
-
-	tailLastSeqResponse, err := client.GetLastSequence(ctx, &emptypb.Empty{})
-
-	if err != nil {
-		return fmt.Errorf("failed to get tail state: %v", err)
-	}
-
-	tailLastSeq := tailLastSeqResponse.Sequence
-	localLastSeq := n.storage.GetLastSequence()
-	if localLastSeq != tailLastSeq {
-		return fmt.Errorf("sync verification failed: local sequence %d != tail sequence %d",
-			localLastSeq, tailLastSeq)
-	}
-
-	log.Printf("Sequence numbers match, confirming sync...")
 
 	// Confirm Synced
 	_, err = cpClient.ConfirmSynced(ctx, &pb.ConfirmSyncedRequest{NodeId: n.nodeID})
@@ -1031,9 +1051,9 @@ func (n *Node) NodeID() string {
 }
 
 func (n *Node) hasPendingWrites() bool {
-	n.pendingMu.RLock()
-	defer n.pendingMu.RUnlock()
-	return len(n.pendingWrites) > 0
+	lastSeq := n.storage.GetLastSequence()
+	lastAck, _ := n.storage.GetLastAcked()
+	return lastSeq > lastAck
 }
 
 // Forwarding methods

@@ -81,7 +81,6 @@ func (cp *ControlPlane) RegisterNode(_ context.Context, req *pb.RegisterNodeRequ
 	// Add to chain
 	cp.chain = append(cp.chain, nodeInfo)
 	cp.logReconfiguration()
-	cp.notifyAllNodes() // It would be better to only notify the tail, but this is easier to write.
 
 	return &emptypb.Empty{}, nil
 }
@@ -145,6 +144,7 @@ func (cp *ControlPlane) ConfirmSynced(_ context.Context, req *pb.ConfirmSyncedRe
 	if state, exists := cp.nodes[req.NodeId]; exists {
 		state.Syncing = false
 		log.Printf("Node %s confirmed synced", req.NodeId)
+		cp.notifyAllNodes() // It would be better to only notify the tail, but this is easier to write.
 	}
 	return &emptypb.Empty{}, nil
 }
