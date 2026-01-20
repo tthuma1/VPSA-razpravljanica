@@ -164,7 +164,14 @@ func (c *Client) LoginUser(ctx context.Context, name, password string) error {
 
 func (c *Client) CreateTopic(ctx context.Context, name string) error {
 	return c.withRetry(func() error {
-		_, err := c.headClient.CreateTopic(ctx, &pb.CreateTopicRequest{Name: name})
+		_, err := c.headClient.CreateTopic(ctx, &pb.CreateTopicRequest{Name: name, UserId: c.currentUser.Id})
+		return err
+	})
+}
+
+func (c *Client) JoinTopic(ctx context.Context, topicID int64) error {
+	return c.withRetry(func() error {
+		_, err := c.headClient.JoinTopic(ctx, &pb.JoinTopicRequest{TopicId: topicID, UserId: c.currentUser.Id})
 		return err
 	})
 }
@@ -211,7 +218,23 @@ func (c *Client) SetMessageLike(ctx context.Context, topicName string, messageID
 }
 
 func (c *Client) ListTopics(ctx context.Context) ([]*pb.Topic, error) {
-	resp, err := c.getReadClient().ListTopics(ctx, &emptypb.Empty{})
+	resp, err := c.getReadClient().ListTopics(ctx, &pb.ListTopicsRequest{UserId: c.currentUser.Id})
+	if err != nil {
+		return nil, err
+	}
+	return resp.Topics, nil
+}
+
+func (c *Client) ListAllTopics(ctx context.Context) ([]*pb.Topic, error) {
+	resp, err := c.getReadClient().ListAllTopics(ctx, &emptypb.Empty{})
+	if err != nil {
+		return nil, err
+	}
+	return resp.Topics, nil
+}
+
+func (c *Client) ListJoinableTopics(ctx context.Context) ([]*pb.Topic, error) {
+	resp, err := c.getReadClient().ListJoinableTopics(ctx, &pb.ListJoinableTopicsRequest{UserId: c.currentUser.Id})
 	if err != nil {
 		return nil, err
 	}
@@ -227,6 +250,19 @@ func (c *Client) GetMessages(ctx context.Context, topicName string, fromID int64
 	resp, err := c.getReadClient().GetMessages(ctx, &pb.GetMessagesRequest{
 		TopicId:       topicID,
 		FromMessageId: fromID,
+		Limit:         limit,
+		RequestUserId: c.currentUser.Id,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp.Messages, nil
+}
+
+func (c *Client) GetMessagesByUser(ctx context.Context, topicID int64, userName string, limit int32) ([]*pb.Message, error) {
+	resp, err := c.getReadClient().GetMessagesByUser(ctx, &pb.GetMessagesByUserRequest{
+		TopicId:       topicID,
+		UserName:      userName,
 		Limit:         limit,
 		RequestUserId: c.currentUser.Id,
 	})

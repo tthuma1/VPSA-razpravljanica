@@ -30,8 +30,9 @@ message Message {
   int64 user_id = 3;
   string text = 4;
   google.protobuf.Timestamp created_at = 5;
-  int32 likes = 6;
-  bool is_liked = 7;
+  string topic_name = 6;
+  int32 likes = 7;
+  bool is_liked = 8;
 }
 
 message Like {
@@ -67,10 +68,13 @@ service MessageBoard {
   rpc PostMessage(PostMessageRequest) returns (Message);
   rpc LikeMessage(LikeMessageRequest) returns (Message);
   rpc GetSubscriptionNode(SubscriptionNodeRequest) returns (SubscriptionNodeResponse);
-  rpc ListTopics(google.protobuf.Empty) returns (ListTopicsResponse);
+  rpc ListTopics(ListTopicsRequest) returns (ListTopicsResponse);
   rpc GetMessages(GetMessagesRequest) returns (GetMessagesResponse);
   rpc GetMessagesByUser(GetMessagesByUserRequest) returns (GetMessagesResponse);
   rpc SubscribeTopic(SubscribeTopicRequest) returns (stream MessageEvent);
+  rpc JoinTopic(JoinTopicRequest) returns (google.protobuf.Empty);
+  rpc ListAllTopics(google.protobuf.Empty) returns (ListTopicsResponse);
+  rpc ListJoinableTopics(ListJoinableTopicsRequest) returns (ListTopicsResponse);
 }
 
 message CreateUserRequest {
@@ -94,6 +98,7 @@ message GetUserByIdRequest {
 
 message CreateTopicRequest {
   string name = 1;
+  int64 user_id = 2;
 }
 
 message GetTopicRequest {
@@ -111,6 +116,14 @@ message LikeMessageRequest {
   int64 message_id = 2;
   int64 user_id = 3;
   bool like = 4; // true = like, false = unlike
+}
+
+message ListTopicsRequest {
+  int64 user_id = 1;
+}
+
+message ListJoinableTopicsRequest {
+  int64 user_id = 1;
 }
 
 message ListTopicsResponse {
@@ -165,6 +178,11 @@ message StateChangeNotification {
   string nextNode = 2;
   bool is_head = 3;
   bool is_tail = 4;
+}
+
+message JoinTopicRequest {
+  int64 topic_id = 1;
+  int64 user_id = 2;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -227,8 +245,9 @@ message WriteOp {
     CreateTopicRequest create_topic = 2;
     PostMessageRequest post_message = 3;
     LikeMessageRequest like_message = 4;
+    JoinTopicRequest join_topic = 5;
   }
-  int64 sequence = 5;
+  int64 sequence = 6;
 }
 
 message AcknowledgeRequest {

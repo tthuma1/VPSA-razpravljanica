@@ -61,7 +61,6 @@ func (s *Storage) initSchema() error {
 		created_at INTEGER NOT NULL,
 		likes INTEGER DEFAULT 0,
 		FOREIGN KEY (topic_id) REFERENCES topics(id),
-		FOREIGN KEY (user_id) REFERENCES messages(id),
 		FOREIGN KEY (user_id) REFERENCES users(id)
 	);
 
@@ -72,6 +71,14 @@ func (s *Storage) initSchema() error {
 		PRIMARY KEY (message_id, user_id),
 		FOREIGN KEY (topic_id) REFERENCES topics(id),
 		FOREIGN KEY (message_id) REFERENCES messages(id),
+		FOREIGN KEY (user_id) REFERENCES users(id)
+	);
+
+	CREATE TABLE IF NOT EXISTS topic_participants (
+		topic_id INTEGER NOT NULL,
+		user_id INTEGER NOT NULL,
+		PRIMARY KEY (topic_id, user_id),
+		FOREIGN KEY (topic_id) REFERENCES topics(id),
 		FOREIGN KEY (user_id) REFERENCES users(id)
 	);
 
@@ -91,6 +98,49 @@ func (s *Storage) initSchema() error {
 
 	_, err := s.db.Exec(schema)
 	return err
+}
+
+func (s *Storage) AddTopicParticipant(topicID, userID int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec("INSERT OR IGNORE INTO topic_participants (topic_id, user_id) VALUES (?, ?)", topicID, userID)
+	return err
+}
+
+func (s *Storage) RemoveTopicParticipant(topicID, userID int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec("DELETE FROM topic_participants WHERE topic_id = ? AND user_id = ?", topicID, userID)
+	return err
+}
+
+func (s *Storage) GetTopicParticipants(topicID int64) ([]*pb.User, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rows, err := s.db.Query(`
+		SELECT u.id, u.name, u.password_hash, u.salt 
+		FROM users u
+		JOIN topic_participants tp ON u.id = tp.user_id
+		WHERE tp.topic_id = ?
+	`, topicID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var users []*pb.User
+	for rows.Next() {
+		var u pb.User
+		if err := rows.Scan(&u.Id, &u.Name, &u.PasswordHash, &u.Salt); err != nil {
+			return nil, err
+		}
+		users = append(users, &u)
+	}
+
+	return users, rows.Err()
 }
 
 func (s *Storage) CreateUser(name, password, salt string) (*pb.User, error) {
@@ -188,7 +238,7 @@ func (s *Storage) GetUserById(id int64) (*pb.User, error) {
 	return &user, nil
 }
 
-func (s *Storage) CreateTopic(name string) (*pb.Topic, error) {
+func (s *Storage) CreateTopic(name string, userID int64) (*pb.Topic, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -210,6 +260,14 @@ func (s *Storage) CreateTopic(name string) (*pb.Topic, error) {
 	id, err := result.LastInsertId()
 	if err != nil {
 		return nil, err
+	}
+
+	// Add creator as participant
+	if userID != 0 {
+		_, err = s.db.Exec("INSERT INTO topic_participants (topic_id, user_id) VALUES (?, ?)", id, userID)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return &pb.Topic{Id: id, Name: name}, nil
@@ -247,6 +305,13 @@ func (s *Storage) PostMessage(topicID, userID int64, text string) (*pb.Message, 
 		return nil, fmt.Errorf("topic does not exist")
 	}
 
+	// Get topic name
+	var topicName string
+	err = s.db.QueryRow("SELECT name FROM topics WHERE id = ?", topicID).Scan(&topicName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get topic name: %w", err)
+	}
+
 	now := time.Now().Unix()
 	result, err := s.db.Exec(
 		"INSERT INTO messages (topic_id, user_id, text, created_at, likes) VALUES (?, ?, ?, ?, 0)",
@@ -268,6 +333,7 @@ func (s *Storage) PostMessage(topicID, userID int64, text string) (*pb.Message, 
 		Text:      text,
 		CreatedAt: timestamppb.New(time.Unix(now, 0)),
 		Likes:     0,
+		TopicName: topicName,
 	}, nil
 }
 
@@ -325,10 +391,12 @@ func (s *Storage) GetMessage(messageID int64, userID int64) (*pb.Message, error)
 	var msg pb.Message
 	var createdAt int64
 
-	err := s.db.QueryRow(
-		"SELECT id, topic_id, user_id, text, created_at, likes FROM messages WHERE id = ?",
-		messageID,
-	).Scan(&msg.Id, &msg.TopicId, &msg.UserId, &msg.Text, &createdAt, &msg.Likes)
+	err := s.db.QueryRow(`
+		SELECT m.id, m.topic_id, m.user_id, m.text, m.created_at, m.likes, t.name
+		FROM messages m
+		JOIN topics t ON m.topic_id = t.id
+		WHERE m.id = ?
+	`, messageID).Scan(&msg.Id, &msg.TopicId, &msg.UserId, &msg.Text, &createdAt, &msg.Likes, &msg.TopicName)
 
 	if err != nil {
 		return nil, err
@@ -348,7 +416,46 @@ func (s *Storage) GetMessage(messageID int64, userID int64) (*pb.Message, error)
 	return &msg, nil
 }
 
-func (s *Storage) ListTopics() ([]*pb.Topic, error) {
+func (s *Storage) ListTopics(userID int64) ([]*pb.Topic, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	log.Printf("Storage ListTopics called with userID: %d", userID)
+
+	var rows *sql.Rows
+	var err error
+
+	if userID == 0 {
+		// Return empty list if no user ID provided, to enforce filtering
+		return []*pb.Topic{}, nil
+	} else {
+		rows, err = s.db.Query(`
+			SELECT t.id, t.name 
+			FROM topics t
+			JOIN topic_participants tp ON t.id = tp.topic_id
+			WHERE tp.user_id = ?
+			ORDER BY t.id
+		`, userID)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var topics []*pb.Topic
+	for rows.Next() {
+		var t pb.Topic
+		if err := rows.Scan(&t.Id, &t.Name); err != nil {
+			return nil, err
+		}
+		topics = append(topics, &t)
+	}
+
+	return topics, rows.Err()
+}
+
+func (s *Storage) ListAllTopics() ([]*pb.Topic, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -370,14 +477,46 @@ func (s *Storage) ListTopics() ([]*pb.Topic, error) {
 	return topics, rows.Err()
 }
 
+func (s *Storage) ListJoinableTopics(userID int64) ([]*pb.Topic, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rows, err := s.db.Query(`
+		SELECT t.id, t.name 
+		FROM topics t
+		WHERE t.id NOT IN (
+			SELECT topic_id FROM topic_participants WHERE user_id = ?
+		)
+		ORDER BY t.id
+	`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var topics []*pb.Topic
+	for rows.Next() {
+		var t pb.Topic
+		if err := rows.Scan(&t.Id, &t.Name); err != nil {
+			return nil, err
+		}
+		topics = append(topics, &t)
+	}
+
+	return topics, rows.Err()
+}
+
 func (s *Storage) GetMessages(topicID, fromMessageID int64, limit int32, requestUserID int64) ([]*pb.Message, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	rows, err := s.db.Query(
-		"SELECT id, topic_id, user_id, text, created_at, likes FROM messages WHERE topic_id = ? AND id >= ? ORDER BY id LIMIT ?",
-		topicID, fromMessageID, limit,
-	)
+	rows, err := s.db.Query(`
+		SELECT m.id, m.topic_id, m.user_id, m.text, m.created_at, m.likes, t.name
+		FROM messages m
+		JOIN topics t ON m.topic_id = t.id
+		WHERE m.topic_id = ? AND m.id >= ?
+		ORDER BY m.id LIMIT ?
+	`, topicID, fromMessageID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -387,7 +526,7 @@ func (s *Storage) GetMessages(topicID, fromMessageID int64, limit int32, request
 	for rows.Next() {
 		var msg pb.Message
 		var createdAt int64
-		if err := rows.Scan(&msg.Id, &msg.TopicId, &msg.UserId, &msg.Text, &createdAt, &msg.Likes); err != nil {
+		if err := rows.Scan(&msg.Id, &msg.TopicId, &msg.UserId, &msg.Text, &createdAt, &msg.Likes, &msg.TopicName); err != nil {
 			return nil, err
 		}
 		msg.CreatedAt = timestamppb.New(time.Unix(createdAt, 0))
@@ -412,7 +551,6 @@ func (s *Storage) GetMessagesByUser(topicID int64, userName string, limit int32,
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	// Get user ID first
 	user, err := s.GetUserByName(userName)
 	if err != nil {
 		return nil, err
@@ -421,29 +559,60 @@ func (s *Storage) GetMessagesByUser(topicID int64, userName string, limit int32,
 		return nil, fmt.Errorf("user not found")
 	}
 
-	rows, err := s.db.Query(
-		"SELECT id, topic_id, user_id, text, created_at, likes FROM messages WHERE topic_id = ? AND user_id = ? ORDER BY id DESC LIMIT ?",
-		topicID, user.Id, limit,
-	)
+	var rows *sql.Rows
+
+	if topicID == 0 {
+		rows, err = s.db.Query(`
+			SELECT m.id, m.topic_id, m.user_id, m.text, m.created_at, m.likes, t.name
+			FROM messages m
+			JOIN topics t ON m.topic_id = t.id
+			WHERE m.user_id = ?
+			ORDER BY m.id DESC
+			LIMIT ?
+		`, user.Id, limit)
+	} else {
+		rows, err = s.db.Query(`
+			SELECT m.id, m.topic_id, m.user_id, m.text, m.created_at, m.likes, t.name
+			FROM messages m
+			JOIN topics t ON m.topic_id = t.id
+			WHERE m.topic_id = ? AND m.user_id = ?
+			ORDER BY m.id DESC
+			LIMIT ?
+		`, topicID, user.Id, limit)
+	}
+
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
 	var messages []*pb.Message
+
 	for rows.Next() {
 		var msg pb.Message
+
 		var createdAt int64
-		if err := rows.Scan(&msg.Id, &msg.TopicId, &msg.UserId, &msg.Text, &createdAt, &msg.Likes); err != nil {
+
+		if err := rows.Scan(
+			&msg.Id,
+			&msg.TopicId,
+			&msg.UserId,
+			&msg.Text,
+			&createdAt,
+			&msg.Likes,
+			&msg.TopicName,
+		); err != nil {
 			return nil, err
 		}
+
 		msg.CreatedAt = timestamppb.New(time.Unix(createdAt, 0))
 
-		// Check if liked by user
 		if requestUserID != 0 {
 			var liked int
-			err = s.db.QueryRow("SELECT COUNT(*) FROM likes WHERE message_id = ? AND user_id = ?", msg.Id, requestUserID).Scan(&liked)
-			if err != nil {
+			if err := s.db.QueryRow(
+				"SELECT COUNT(*) FROM likes WHERE message_id = ? AND user_id = ?",
+				msg.Id, requestUserID,
+			).Scan(&liked); err != nil {
 				return nil, err
 			}
 			msg.IsLiked = liked > 0

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"regexp"
+	"strings"
 	"time"
 
 	"messageboard/internal/client"
@@ -138,7 +139,11 @@ func (c *UIClient) setupUI() {
 					highlights := c.messageView.GetHighlights()
 					if len(highlights) > 0 {
 						regionID := highlights[0]
-						c.handleLikeClick(regionID)
+						if strings.HasPrefix(regionID, "like_") {
+							c.handleLikeClick(regionID)
+						} else if strings.HasPrefix(regionID, "user_") {
+							c.handleUserClick(regionID)
+						}
 						c.messageView.Highlight() // Clear highlights
 					}
 				})
@@ -173,6 +178,10 @@ func (c *UIClient) setupUI() {
 		AddItem(nil, 1, 0, false).
 		AddItem(tview.NewButton("Create Topic").SetSelectedFunc(func() {
 			c.showCreateTopicForm()
+		}), 3, 0, false).
+		AddItem(nil, 1, 0, false).
+		AddItem(tview.NewButton("Join Group").SetSelectedFunc(func() {
+			c.showJoinTopicList()
 		}), 3, 0, false).
 		AddItem(nil, 1, 0, false).
 		AddItem(tview.NewButton("Refresh").SetSelectedFunc(func() {
@@ -210,6 +219,85 @@ func (c *UIClient) handleLikeClick(regionID string) {
 	}
 
 	c.likeMessage(msgID)
+}
+
+func (c *UIClient) handleUserClick(regionID string) {
+	var userID int64
+	_, err := fmt.Sscanf(regionID, "user_%d", &userID)
+	if err != nil {
+		return
+	}
+	c.showUserProfile(userID)
+}
+
+func (c *UIClient) showUserProfile(userID int64) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		// 1. Get User Details
+		user, err := c.GetUserById(ctx, userID)
+		if err != nil {
+			c.showError(fmt.Sprintf("Failed to get user profile: %v", err))
+			return
+		}
+
+		// 2. Get User Messages
+		messages, err := c.GetMessagesByUser(ctx, 0, user.Name, 10)
+		if err != nil {
+			c.showError(fmt.Sprintf("Failed to get user messages: %v", err))
+			return
+		}
+
+		c.app.QueueUpdateDraw(func() {
+			// Use a TextView for the main content, without its own border
+			textView := tview.NewTextView().
+				SetDynamicColors(true).
+				SetWordWrap(true).
+				SetScrollable(true)
+
+			// Improved text formatting for clarity
+			fmt.Fprintf(textView, "[yellow]Recent Messages (%d):[white]\n", len(messages))
+			fmt.Fprintf(textView, "[gray]%s\n", strings.Repeat("─", 50)) // Separator
+
+			if len(messages) == 0 {
+				fmt.Fprintf(textView, "\nNo messages found.\n")
+			} else {
+				for _, msg := range messages {
+					fmt.Fprintf(textView, "\n[#66c2ff]Topic: %s[white]\n", msg.TopicName)
+					fmt.Fprintf(textView, "  %s\n", msg.Text)
+					fmt.Fprintf(textView, "  [green]♥ %d[white]\n", msg.Likes)
+				}
+			}
+
+			// Use a Flex layout to create a modal-like box with a close button at the bottom.
+			// This is more idiomatic for tview than trying to force a GUI-style [X] button.
+			modal := tview.NewFlex().SetDirection(tview.FlexRow)
+
+			// Content
+			modal.AddItem(textView, 0, 1, false)
+
+			// Close button
+			button := tview.NewButton("Close").SetSelectedFunc(func() {
+				c.pages.RemovePage("user_profile")
+			})
+			modal.AddItem(button, 1, 0, true)
+
+			// Set a border and title on the whole modal
+			modal.SetBorder(true).SetTitle(fmt.Sprintf("Profile: %s (ID: %d)", user.Name, user.Id))
+
+			// Capture Esc key on the modal to also close it
+			modal.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+				if event.Key() == tcell.KeyEscape {
+					c.pages.RemovePage("user_profile")
+					return nil
+				}
+				return event
+			})
+
+			c.pages.AddPage("user_profile", c.center(modal, 60, 20), true, true)
+		})
+	}()
 }
 
 func (c *UIClient) center(p tview.Primitive, width, height int) tview.Primitive {
@@ -261,6 +349,60 @@ func (c *UIClient) showCreateTopicForm() {
 	form.SetBorder(true).SetTitle("Create Topic")
 
 	c.pages.AddPage("create_topic_form", c.center(form, 40, 10), true, true)
+}
+
+func (c *UIClient) showJoinTopicList() {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		topics, err := c.ListJoinableTopics(ctx)
+		if err != nil {
+			c.showError(fmt.Sprintf("Error listing joinable topics: %v", err))
+			return
+		}
+
+		c.app.QueueUpdateDraw(func() {
+			list := tview.NewList().ShowSecondaryText(false)
+			list.SetBorder(true).SetTitle("Join Group")
+
+			for _, topic := range topics {
+				// Capture topic ID for closure
+				tID := topic.Id
+				tName := topic.Name
+				list.AddItem(tName, "", 0, func() {
+					c.pages.RemovePage("join_topic_list")
+					go func() {
+						c.joinTopic(tID, tName)
+						time.Sleep(500 * time.Millisecond)
+						c.app.QueueUpdateDraw(func() {
+							c.refreshTopics()
+						})
+					}()
+				})
+			}
+
+			list.AddItem("Cancel", "", 'c', func() {
+				c.pages.RemovePage("join_topic_list")
+			})
+
+			c.pages.AddPage("join_topic_list", c.center(list, 40, 20), true, true)
+		})
+	}()
+}
+
+func (c *UIClient) joinTopic(topicID int64, topicName string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := c.JoinTopic(ctx, topicID)
+	if err != nil {
+		c.showError(status.Convert(err).Message())
+	} else {
+		c.app.QueueUpdateDraw(func() {
+			c.statusLine.SetText(fmt.Sprintf("Joined topic: %s", topicName))
+		})
+	}
 }
 
 func (c *UIClient) refreshTopics() {
@@ -598,7 +740,7 @@ func (c *UIClient) printMessage(msg *pb.Message) {
 
 	// Format: [User]: Message
 	//         [LikeButton] Count
-	fmt.Fprintf(c.messageView, "[yellow]%s[white]: %s\n", userName, msg.Text)
+	fmt.Fprintf(c.messageView, "[\"user_%d\"][yellow]%s[\"\"][white]: %s\n", msg.UserId, userName, msg.Text)
 
 	// Create a region for the like button
 	regionID := fmt.Sprintf("like_%d", msg.Id)
