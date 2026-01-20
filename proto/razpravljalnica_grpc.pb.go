@@ -22,22 +22,23 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	MessageBoard_CreateUser_FullMethodName          = "/razpravljalnica.MessageBoard/CreateUser"
-	MessageBoard_Login_FullMethodName               = "/razpravljalnica.MessageBoard/Login"
-	MessageBoard_GetUser_FullMethodName             = "/razpravljalnica.MessageBoard/GetUser"
-	MessageBoard_GetUserById_FullMethodName         = "/razpravljalnica.MessageBoard/GetUserById"
-	MessageBoard_CreateTopic_FullMethodName         = "/razpravljalnica.MessageBoard/CreateTopic"
-	MessageBoard_GetTopic_FullMethodName            = "/razpravljalnica.MessageBoard/GetTopic"
-	MessageBoard_PostMessage_FullMethodName         = "/razpravljalnica.MessageBoard/PostMessage"
-	MessageBoard_LikeMessage_FullMethodName         = "/razpravljalnica.MessageBoard/LikeMessage"
-	MessageBoard_GetSubscriptionNode_FullMethodName = "/razpravljalnica.MessageBoard/GetSubscriptionNode"
-	MessageBoard_ListTopics_FullMethodName          = "/razpravljalnica.MessageBoard/ListTopics"
-	MessageBoard_GetMessages_FullMethodName         = "/razpravljalnica.MessageBoard/GetMessages"
-	MessageBoard_GetMessagesByUser_FullMethodName   = "/razpravljalnica.MessageBoard/GetMessagesByUser"
-	MessageBoard_SubscribeTopic_FullMethodName      = "/razpravljalnica.MessageBoard/SubscribeTopic"
-	MessageBoard_JoinTopic_FullMethodName           = "/razpravljalnica.MessageBoard/JoinTopic"
-	MessageBoard_ListAllTopics_FullMethodName       = "/razpravljalnica.MessageBoard/ListAllTopics"
-	MessageBoard_ListJoinableTopics_FullMethodName  = "/razpravljalnica.MessageBoard/ListJoinableTopics"
+	MessageBoard_CreateUser_FullMethodName                = "/razpravljalnica.MessageBoard/CreateUser"
+	MessageBoard_Login_FullMethodName                     = "/razpravljalnica.MessageBoard/Login"
+	MessageBoard_GetUser_FullMethodName                   = "/razpravljalnica.MessageBoard/GetUser"
+	MessageBoard_GetUserById_FullMethodName               = "/razpravljalnica.MessageBoard/GetUserById"
+	MessageBoard_CreateTopic_FullMethodName               = "/razpravljalnica.MessageBoard/CreateTopic"
+	MessageBoard_GetTopic_FullMethodName                  = "/razpravljalnica.MessageBoard/GetTopic"
+	MessageBoard_PostMessage_FullMethodName               = "/razpravljalnica.MessageBoard/PostMessage"
+	MessageBoard_LikeMessage_FullMethodName               = "/razpravljalnica.MessageBoard/LikeMessage"
+	MessageBoard_GetSubscriptionNode_FullMethodName       = "/razpravljalnica.MessageBoard/GetSubscriptionNode"
+	MessageBoard_ListTopics_FullMethodName                = "/razpravljalnica.MessageBoard/ListTopics"
+	MessageBoard_GetMessages_FullMethodName               = "/razpravljalnica.MessageBoard/GetMessages"
+	MessageBoard_GetMessagesByUser_FullMethodName         = "/razpravljalnica.MessageBoard/GetMessagesByUser"
+	MessageBoard_GetTopLikedMessagesByUser_FullMethodName = "/razpravljalnica.MessageBoard/GetTopLikedMessagesByUser"
+	MessageBoard_SubscribeTopic_FullMethodName            = "/razpravljalnica.MessageBoard/SubscribeTopic"
+	MessageBoard_JoinTopic_FullMethodName                 = "/razpravljalnica.MessageBoard/JoinTopic"
+	MessageBoard_ListAllTopics_FullMethodName             = "/razpravljalnica.MessageBoard/ListAllTopics"
+	MessageBoard_ListJoinableTopics_FullMethodName        = "/razpravljalnica.MessageBoard/ListJoinableTopics"
 )
 
 // MessageBoardClient is the client API for MessageBoard service.
@@ -56,6 +57,7 @@ type MessageBoardClient interface {
 	ListTopics(ctx context.Context, in *ListTopicsRequest, opts ...grpc.CallOption) (*ListTopicsResponse, error)
 	GetMessages(ctx context.Context, in *GetMessagesRequest, opts ...grpc.CallOption) (*GetMessagesResponse, error)
 	GetMessagesByUser(ctx context.Context, in *GetMessagesByUserRequest, opts ...grpc.CallOption) (*GetMessagesResponse, error)
+	GetTopLikedMessagesByUser(ctx context.Context, in *GetMessagesByUserRequest, opts ...grpc.CallOption) (*GetMessagesResponse, error)
 	SubscribeTopic(ctx context.Context, in *SubscribeTopicRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MessageEvent], error)
 	JoinTopic(ctx context.Context, in *JoinTopicRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	ListAllTopics(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*ListTopicsResponse, error)
@@ -190,6 +192,16 @@ func (c *messageBoardClient) GetMessagesByUser(ctx context.Context, in *GetMessa
 	return out, nil
 }
 
+func (c *messageBoardClient) GetTopLikedMessagesByUser(ctx context.Context, in *GetMessagesByUserRequest, opts ...grpc.CallOption) (*GetMessagesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetMessagesResponse)
+	err := c.cc.Invoke(ctx, MessageBoard_GetTopLikedMessagesByUser_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *messageBoardClient) SubscribeTopic(ctx context.Context, in *SubscribeTopicRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MessageEvent], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &MessageBoard_ServiceDesc.Streams[0], MessageBoard_SubscribeTopic_FullMethodName, cOpts...)
@@ -255,6 +267,7 @@ type MessageBoardServer interface {
 	ListTopics(context.Context, *ListTopicsRequest) (*ListTopicsResponse, error)
 	GetMessages(context.Context, *GetMessagesRequest) (*GetMessagesResponse, error)
 	GetMessagesByUser(context.Context, *GetMessagesByUserRequest) (*GetMessagesResponse, error)
+	GetTopLikedMessagesByUser(context.Context, *GetMessagesByUserRequest) (*GetMessagesResponse, error)
 	SubscribeTopic(*SubscribeTopicRequest, grpc.ServerStreamingServer[MessageEvent]) error
 	JoinTopic(context.Context, *JoinTopicRequest) (*emptypb.Empty, error)
 	ListAllTopics(context.Context, *emptypb.Empty) (*ListTopicsResponse, error)
@@ -304,6 +317,9 @@ func (UnimplementedMessageBoardServer) GetMessages(context.Context, *GetMessages
 }
 func (UnimplementedMessageBoardServer) GetMessagesByUser(context.Context, *GetMessagesByUserRequest) (*GetMessagesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetMessagesByUser not implemented")
+}
+func (UnimplementedMessageBoardServer) GetTopLikedMessagesByUser(context.Context, *GetMessagesByUserRequest) (*GetMessagesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetTopLikedMessagesByUser not implemented")
 }
 func (UnimplementedMessageBoardServer) SubscribeTopic(*SubscribeTopicRequest, grpc.ServerStreamingServer[MessageEvent]) error {
 	return status.Error(codes.Unimplemented, "method SubscribeTopic not implemented")
@@ -554,6 +570,24 @@ func _MessageBoard_GetMessagesByUser_Handler(srv interface{}, ctx context.Contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _MessageBoard_GetTopLikedMessagesByUser_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetMessagesByUserRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MessageBoardServer).GetTopLikedMessagesByUser(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MessageBoard_GetTopLikedMessagesByUser_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MessageBoardServer).GetTopLikedMessagesByUser(ctx, req.(*GetMessagesByUserRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _MessageBoard_SubscribeTopic_Handler(srv interface{}, stream grpc.ServerStream) error {
 	m := new(SubscribeTopicRequest)
 	if err := stream.RecvMsg(m); err != nil {
@@ -673,6 +707,10 @@ var MessageBoard_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetMessagesByUser",
 			Handler:    _MessageBoard_GetMessagesByUser_Handler,
+		},
+		{
+			MethodName: "GetTopLikedMessagesByUser",
+			Handler:    _MessageBoard_GetTopLikedMessagesByUser_Handler,
 		},
 		{
 			MethodName: "JoinTopic",

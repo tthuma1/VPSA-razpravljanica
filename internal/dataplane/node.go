@@ -571,6 +571,7 @@ func (n *Node) GetMessagesByUser(ctx context.Context, req *pb.GetMessagesByUserR
 	}
 
 	messages, err := n.storage.GetMessagesByUser(req.TopicId, req.UserName, req.Limit, req.RequestUserId)
+	fmt.Println(messages)
 	if err != nil {
 		return nil, err
 	}

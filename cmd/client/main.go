@@ -235,12 +235,14 @@ func (c *UIClient) showUserProfile(userID int64) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
+		// 1. Get User Details
 		user, err := c.GetUserById(ctx, userID)
 		if err != nil {
 			c.showError(fmt.Sprintf("Failed to get user profile: %v", err))
 			return
 		}
 
+		// 2. Get User Messages
 		messages, err := c.GetMessagesByUser(ctx, 0, user.Name, 10)
 		if err != nil {
 			c.showError(fmt.Sprintf("Failed to get user messages: %v", err))
@@ -248,27 +250,52 @@ func (c *UIClient) showUserProfile(userID int64) {
 		}
 
 		c.app.QueueUpdateDraw(func() {
+			// Use a TextView for the main content, without its own border
 			textView := tview.NewTextView().
 				SetDynamicColors(true).
-				SetWordWrap(true)
-			textView.SetBorder(true).SetTitle(fmt.Sprintf("Profile: %s (ID: %d)", user.Name, user.Id))
+				SetWordWrap(true).
+				SetScrollable(true)
 
-			fmt.Fprintf(textView, "[yellow]Recent Messages:[white]\n\n")
+			// Improved text formatting for clarity
+			fmt.Fprintf(textView, "[yellow]Recent Messages (%d):[white]\n", len(messages))
+			fmt.Fprintf(textView, "[gray]%s\n", strings.Repeat("─", 50)) // Separator
+
 			if len(messages) == 0 {
-				fmt.Fprintf(textView, "No messages found.")
+				fmt.Fprintf(textView, "\nNo messages found.\n")
 			} else {
 				for _, msg := range messages {
-					fmt.Fprintf(textView, "- %s\n", msg.Text)
+					fmt.Fprintf(textView, "\n[#66c2ff]Topic: %s[white]\n", msg.TopicName)
+					fmt.Fprintf(textView, "  %s\n", msg.Text)
+					fmt.Fprintf(textView, "  [green]♥ %d[white]\n", msg.Likes)
 				}
 			}
 
-			flex := tview.NewFlex().SetDirection(tview.FlexRow).
-				AddItem(textView, 0, 1, false).
-				AddItem(tview.NewButton("Close").SetSelectedFunc(func() {
-					c.pages.RemovePage("user_profile")
-				}), 3, 0, true)
+			// Use a Flex layout to create a modal-like box with a close button at the bottom.
+			// This is more idiomatic for tview than trying to force a GUI-style [X] button.
+			modal := tview.NewFlex().SetDirection(tview.FlexRow)
 
-			c.pages.AddPage("user_profile", c.center(flex, 60, 20), true, true)
+			// Content
+			modal.AddItem(textView, 0, 1, false)
+
+			// Close button
+			button := tview.NewButton("Close").SetSelectedFunc(func() {
+				c.pages.RemovePage("user_profile")
+			})
+			modal.AddItem(button, 1, 0, true)
+
+			// Set a border and title on the whole modal
+			modal.SetBorder(true).SetTitle(fmt.Sprintf("Profile: %s (ID: %d)", user.Name, user.Id))
+
+			// Capture Esc key on the modal to also close it
+			modal.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+				if event.Key() == tcell.KeyEscape {
+					c.pages.RemovePage("user_profile")
+					return nil
+				}
+				return event
+			})
+
+			c.pages.AddPage("user_profile", c.center(modal, 60, 20), true, true)
 		})
 	}()
 }

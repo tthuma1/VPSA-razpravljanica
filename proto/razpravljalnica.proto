@@ -30,8 +30,9 @@ message Message {
   int64 user_id = 3;
   string text = 4;
   google.protobuf.Timestamp created_at = 5;
-  int32 likes = 6;
-  bool is_liked = 7;
+  string topic_name = 6;
+  int32 likes = 7;
+  bool is_liked = 8;
 }
 
 message Like {
