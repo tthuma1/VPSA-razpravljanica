@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -360,6 +361,16 @@ func (c *UIClient) showUserProfile(userID int64) {
 			// Content
 			modal.AddItem(textView, 0, 1, false)
 
+			// Message button
+			if !c.Client.IsCurrentUser(userID) {
+				msgButton := tview.NewButton("Message").SetSelectedFunc(func() {
+					c.pages.RemovePage("user_profile")
+					c.startDirectMessage(user)
+				})
+				modal.AddItem(msgButton, 1, 0, false)
+				modal.AddItem(nil, 1, 0, false) // Spacer
+			}
+
 			// Close button
 			button := tview.NewButton("Close").SetSelectedFunc(func() {
 				c.pages.RemovePage("user_profile")
@@ -379,6 +390,60 @@ func (c *UIClient) showUserProfile(userID int64) {
 			})
 
 			c.pages.AddPage("user_profile", c.center(modal, 60, 20), true, true)
+		})
+	}()
+}
+
+func (c *UIClient) startDirectMessage(otherUser *pb.User) {
+	go func() {
+		// Construct DM topic name: _user1_user2 (sorted alphabetically)
+		currentUser := c.Client.GetCurrentUserName()
+		otherUserName := otherUser.Name
+
+		names := []string{currentUser, otherUserName}
+		sort.Strings(names)
+		dmTopicName := fmt.Sprintf("_%s_%s", names[0], names[1])
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		// Check if topic exists
+		topic, err := c.Client.GetTopicByName(ctx, dmTopicName)
+		if err != nil {
+			// If not found, create it
+			if status.Code(err) == codes.NotFound || strings.Contains(err.Error(), "not found") {
+				err = c.Client.CreateTopic(ctx, dmTopicName)
+				if err != nil {
+					c.showError(fmt.Sprintf("Failed to create DM topic: %v", err))
+					return
+				}
+				// Wait a bit for propagation
+				time.Sleep(500 * time.Millisecond)
+				// Fetch again to get ID
+				topic, err = c.Client.GetTopicByName(ctx, dmTopicName)
+				if err != nil {
+					c.showError(fmt.Sprintf("Failed to get DM topic after creation: %v", err))
+					return
+				}
+			} else {
+				c.showError(fmt.Sprintf("Failed to check DM topic: %v", err))
+				return
+			}
+		}
+
+		// Join the topic for current user
+		_ = c.Client.JoinTopic(ctx, topic.Id)
+
+		// Also join the topic for the other user so it appears in their list
+		err = c.Client.JoinTopicForUser(ctx, topic.Id, otherUser.Id)
+		if err != nil {
+			fmt.Printf("Failed to auto-join other user to DM: %v\n", err)
+		}
+
+		c.app.QueueUpdateDraw(func() {
+			c.refreshTopics()
+			// Select the topic
+			c.selectTopic(dmTopicName)
 		})
 	}()
 }
@@ -443,6 +508,11 @@ func (c *UIClient) showJoinTopicList() {
 			list.SetBorder(true).SetTitle("Join Group")
 
 			for _, topic := range topics {
+				// Filter out DM topics from join list
+				if strings.HasPrefix(topic.Name, "_") {
+					continue
+				}
+
 				// Capture topic ID for closure
 				tID := topic.Id
 				tName := topic.Name
@@ -508,7 +578,14 @@ func (c *UIClient) leaveTopicByID(topicID int64) {
 			// Check if we left the current topic
 			topic := c.getTopicByID(topicID)
 			if topic != nil && topic.Name == c.currentTopic {
+				if c.cancelSub != nil {
+					c.cancelSub()
+					c.cancelSub = nil
+				}
 				c.currentTopic = ""
+				c.messages = nil
+				c.messageLikes = make(map[int64]int)
+				c.messageLiked = make(map[int64]bool)
 				c.messageView.Clear()
 				c.messageView.SetTitle("Messages")
 				c.statusLine.SetText(fmt.Sprintf("Left topic: %s", topic.Name))
@@ -538,6 +615,25 @@ func (c *UIClient) refreshTopics() {
 
 	for _, topic := range topics {
 		name := topic.Name
+
+		// Handle DM display name
+		if strings.HasPrefix(name, "_") {
+			// Format: _user1_user2
+			parts := strings.Split(name, "_")
+			if len(parts) >= 3 {
+				// parts[0] is empty because string starts with _
+				// parts[1] is user1, parts[2] is user2
+				u1 := parts[1]
+				u2 := parts[2]
+				currentUser := c.Client.GetCurrentUserName()
+				if u1 == currentUser {
+					name = "_" + u2
+				} else {
+					name = "_" + u1
+				}
+			}
+		}
+
 		if len(name) > lineWidth {
 			name = name[:lineWidth]
 		}
@@ -624,9 +720,25 @@ func (c *UIClient) selectTopic(name string) {
 	}
 
 	c.currentTopic = name
+
+	displayName := name
+	if strings.HasPrefix(name, "_") {
+		parts := strings.Split(name, "_")
+		if len(parts) >= 3 {
+			u1 := parts[1]
+			u2 := parts[2]
+			currentUser := c.Client.GetCurrentUserName()
+			if u1 == currentUser {
+				displayName = "_" + u2
+			} else {
+				displayName = "_" + u1
+			}
+		}
+	}
+
 	c.messageView.Clear()
-	c.messageView.SetTitle(fmt.Sprintf("Messages: %s", name))
-	c.statusLine.SetText(fmt.Sprintf("Joined topic: %s", name))
+	c.messageView.SetTitle(fmt.Sprintf("Messages: %s", displayName))
+	c.statusLine.SetText(fmt.Sprintf("Joined topic: %s", displayName))
 	c.app.SetFocus(c.inputField)
 
 	// Reset message tracking for new topic
@@ -649,6 +761,27 @@ func (c *UIClient) postMessage(text string) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+
+		// If it's a DM, ensure the other user is in the topic
+		if strings.HasPrefix(c.currentTopic, "_") {
+			parts := strings.Split(c.currentTopic, "_")
+			if len(parts) >= 3 {
+				u1 := parts[1]
+				u2 := parts[2]
+				otherUserName := u1
+				if u1 == c.Client.GetCurrentUserName() {
+					otherUserName = u2
+				}
+
+				otherUser, err := c.Client.GetUserByName(ctx, otherUserName)
+				if err == nil {
+					topic, err := c.Client.GetTopicByName(ctx, c.currentTopic)
+					if err == nil {
+						_ = c.Client.JoinTopicForUser(ctx, topic.Id, otherUser.Id)
+					}
+				}
+			}
+		}
 
 		err := c.PostMessage(ctx, c.currentTopic, text)
 		if err != nil {
@@ -849,6 +982,15 @@ func (c *UIClient) subscribeInternal(ctx context.Context, topicNames []string, l
 		}
 
 		c.app.QueueUpdateDraw(func() {
+			// Check if we are still on the same topic
+			if c.currentTopic == "" {
+				return
+			}
+			// If message has topic name, verify it matches current topic
+			if event.Message != nil && event.Message.TopicName != "" && event.Message.TopicName != c.currentTopic {
+				return
+			}
+
 			if event.Op == pb.OpType_OP_POST {
 				if event.Message != nil && event.Message.Id > *lastMessageID {
 					*lastMessageID = event.Message.Id

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -602,7 +603,15 @@ func (n *Node) ListJoinableTopics(ctx context.Context, req *pb.ListJoinableTopic
 		return nil, err
 	}
 
-	return &pb.ListTopicsResponse{Topics: topics}, nil
+	// Filter out DM topics (starting with _)
+	filteredTopics := make([]*pb.Topic, 0, len(topics))
+	for _, t := range topics {
+		if !strings.HasPrefix(t.Name, "_") {
+			filteredTopics = append(filteredTopics, t)
+		}
+	}
+
+	return &pb.ListTopicsResponse{Topics: filteredTopics}, nil
 }
 
 func (n *Node) GetMessages(ctx context.Context, req *pb.GetMessagesRequest) (*pb.GetMessagesResponse, error) {
