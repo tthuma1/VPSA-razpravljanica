@@ -162,12 +162,30 @@ func (c *Client) JoinTopic(ctx context.Context, topicID int64) error {
 	})
 }
 
+func (c *Client) JoinTopicForUser(ctx context.Context, topicID int64, userID int64) error {
+	return c.withRetry(func() error {
+		_, err := c.headClient.JoinTopic(ctx, &pb.JoinTopicRequest{TopicId: topicID, UserId: userID})
+		return err
+	})
+}
+
+func (c *Client) LeaveTopic(ctx context.Context, topicID int64) error {
+	return c.withRetry(func() error {
+		_, err := c.headClient.LeaveTopic(ctx, &pb.LeaveTopicRequest{TopicId: topicID, UserId: c.currentUser.Id})
+		return err
+	})
+}
+
 func (c *Client) getTopicID(ctx context.Context, name string) (int64, error) {
 	topic, err := c.getReadClient().GetTopic(ctx, &pb.GetTopicRequest{Name: name})
 	if err != nil {
 		return 0, err
 	}
 	return topic.Id, nil
+}
+
+func (c *Client) GetTopicByName(ctx context.Context, name string) (*pb.Topic, error) {
+	return c.getReadClient().GetTopic(ctx, &pb.GetTopicRequest{Name: name})
 }
 
 func (c *Client) PostMessage(ctx context.Context, topicName string, text string) error {
@@ -260,6 +278,10 @@ func (c *Client) GetMessagesByUser(ctx context.Context, topicID int64, userName 
 
 func (c *Client) GetUserById(ctx context.Context, id int64) (*pb.User, error) {
 	return c.getReadClient().GetUserById(ctx, &pb.GetUserByIdRequest{Id: id})
+}
+
+func (c *Client) GetUserByName(ctx context.Context, name string) (*pb.User, error) {
+	return c.getReadClient().GetUser(ctx, &pb.GetUserRequest{Name: name})
 }
 
 func (c *Client) GetSubscriptionNode(ctx context.Context, topicIDs []int64) (*pb.SubscriptionNodeResponse, error) {

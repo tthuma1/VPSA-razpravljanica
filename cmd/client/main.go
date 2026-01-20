@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -31,7 +32,7 @@ type UIClient struct {
 	loginForm    *tview.Form
 	registerForm *tview.Form
 	mainFlex     *tview.Flex
-	topicList    *tview.List
+	topicList    *tview.TextView // Changed to TextView for custom regions
 	messageView  *tview.TextView
 	inputField   *tview.InputField
 	statusLine   *tview.TextView
@@ -46,6 +47,10 @@ type UIClient struct {
 	messageLikes map[int64]int
 	// Map message ID to whether current user liked it
 	messageLiked map[int64]bool
+
+	// Cached topics for navigation
+	cachedTopics []*pb.Topic
+	navigating   bool
 }
 
 func main() {
@@ -59,6 +64,7 @@ func main() {
 		messageLikes: make(map[int64]int),
 		messageLiked: make(map[int64]bool),
 		messages:     make([]*pb.Message, 0),
+		cachedTopics: make([]*pb.Topic, 0),
 	}
 	defer uiClient.Close()
 
@@ -108,17 +114,95 @@ func (c *UIClient) setupUI() {
 		})
 	c.registerForm.SetBorder(true).SetTitle("Register").SetTitleAlign(tview.AlignCenter)
 
-	// Main UI
-	c.topicList = tview.NewList().ShowSecondaryText(false).SetHighlightFullLine(true)
+	// Main UI - Topic List as TextView
+	c.topicList = tview.NewTextView().
+		SetDynamicColors(true).
+		SetRegions(true).
+		SetWordWrap(false).
+		SetScrollable(true)
 	c.topicList.SetBorder(true).SetTitle("Topics")
-	c.topicList.SetSelectedFunc(func(index int, mainText string, secondaryText string, shortcut rune) {
-		c.selectTopic(mainText)
 
-		c.topicList.
-			SetSelectedBackgroundColor(tcell.ColorBlue).
-			SetSelectedTextColor(tcell.ColorWhite)
+	// Handle highlighting (clicks)
+	c.topicList.SetHighlightedFunc(func(added, removed, remaining []string) {
+		if c.navigating {
+			return
+		}
 
-	}).SetHighlightFullLine(false)
+		if len(added) > 0 {
+			idStr := added[0]
+			if strings.HasPrefix(idStr, "leave_") {
+				// Trashcan clicked
+				var tID int64
+				fmt.Sscanf(idStr, "leave_%d", &tID)
+
+				// Revert highlight to the topic if possible, or just clear
+				// We don't want the trashcan to stay highlighted
+				c.navigating = true
+				c.topicList.Highlight(removed...)
+				c.navigating = false
+
+				c.leaveTopicByID(tID)
+			} else if strings.HasPrefix(idStr, "topic_") {
+				// Topic clicked
+				var tID int64
+				fmt.Sscanf(idStr, "topic_%d", &tID)
+
+				topic := c.getTopicByID(tID)
+				if topic != nil {
+					c.selectTopic(topic.Name)
+				}
+
+				// Ensure only this topic is highlighted
+				c.navigating = true
+				c.topicList.Highlight(idStr)
+				c.topicList.ScrollToHighlight()
+				c.navigating = false
+			}
+		} else if len(removed) > 0 {
+			// If user clicked the already highlighted topic, it gets removed.
+			// We should re-highlight it and treat it as selection.
+			idStr := removed[0]
+			if strings.HasPrefix(idStr, "topic_") {
+				c.navigating = true
+				c.topicList.Highlight(idStr)
+				c.navigating = false
+
+				var tID int64
+				fmt.Sscanf(idStr, "topic_%d", &tID)
+				topic := c.getTopicByID(tID)
+				if topic != nil {
+					c.selectTopic(topic.Name)
+				}
+			}
+		}
+	})
+
+	// Handle keyboard navigation
+	c.topicList.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyDown {
+			c.moveTopicSelection(1)
+			return nil
+		} else if event.Key() == tcell.KeyUp {
+			c.moveTopicSelection(-1)
+			return nil
+		} else if event.Key() == tcell.KeyEnter {
+			// Select currently highlighted topic
+			highlights := c.topicList.GetHighlights()
+			if len(highlights) > 0 && strings.HasPrefix(highlights[0], "topic_") {
+				var tID int64
+				fmt.Sscanf(highlights[0], "topic_%d", &tID)
+				topic := c.getTopicByID(tID)
+				if topic != nil {
+					c.selectTopic(topic.Name)
+				}
+			}
+			return nil
+		} else if event.Rune() == 'x' {
+			c.leaveHighlightedTopic()
+			return nil
+		}
+		return event
+	})
 
 	c.messageView = tview.NewTextView().
 		SetDynamicColors(true).
@@ -277,6 +361,16 @@ func (c *UIClient) showUserProfile(userID int64) {
 			// Content
 			modal.AddItem(textView, 0, 1, false)
 
+			// Message button
+			if !c.Client.IsCurrentUser(userID) {
+				msgButton := tview.NewButton("Message").SetSelectedFunc(func() {
+					c.pages.RemovePage("user_profile")
+					c.startDirectMessage(user)
+				})
+				modal.AddItem(msgButton, 1, 0, false)
+				modal.AddItem(nil, 1, 0, false) // Spacer
+			}
+
 			// Close button
 			button := tview.NewButton("Close").SetSelectedFunc(func() {
 				c.pages.RemovePage("user_profile")
@@ -284,7 +378,7 @@ func (c *UIClient) showUserProfile(userID int64) {
 			modal.AddItem(button, 1, 0, true)
 
 			// Set a border and title on the whole modal
-			modal.SetBorder(true).SetTitle(fmt.Sprintf("Profile: %s (ID: %d)", user.Name, user.Id))
+			modal.SetBorder(true).SetTitle(fmt.Sprintf("Profile: %s", user.Name))
 
 			// Capture Esc key on the modal to also close it
 			modal.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
@@ -296,6 +390,60 @@ func (c *UIClient) showUserProfile(userID int64) {
 			})
 
 			c.pages.AddPage("user_profile", c.center(modal, 60, 20), true, true)
+		})
+	}()
+}
+
+func (c *UIClient) startDirectMessage(otherUser *pb.User) {
+	go func() {
+		// Construct DM topic name: _user1_user2 (sorted alphabetically)
+		currentUser := c.Client.GetCurrentUserName()
+		otherUserName := otherUser.Name
+
+		names := []string{currentUser, otherUserName}
+		sort.Strings(names)
+		dmTopicName := fmt.Sprintf("_%s_%s", names[0], names[1])
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		// Check if topic exists
+		topic, err := c.Client.GetTopicByName(ctx, dmTopicName)
+		if err != nil {
+			// If not found, create it
+			if status.Code(err) == codes.NotFound || strings.Contains(err.Error(), "not found") {
+				err = c.Client.CreateTopic(ctx, dmTopicName)
+				if err != nil {
+					c.showError(fmt.Sprintf("Failed to create DM topic: %v", err))
+					return
+				}
+				// Wait a bit for propagation
+				time.Sleep(500 * time.Millisecond)
+				// Fetch again to get ID
+				topic, err = c.Client.GetTopicByName(ctx, dmTopicName)
+				if err != nil {
+					c.showError(fmt.Sprintf("Failed to get DM topic after creation: %v", err))
+					return
+				}
+			} else {
+				c.showError(fmt.Sprintf("Failed to check DM topic: %v", err))
+				return
+			}
+		}
+
+		// Join the topic for current user
+		_ = c.Client.JoinTopic(ctx, topic.Id)
+
+		// Also join the topic for the other user so it appears in their list
+		err = c.Client.JoinTopicForUser(ctx, topic.Id, otherUser.Id)
+		if err != nil {
+			fmt.Printf("Failed to auto-join other user to DM: %v\n", err)
+		}
+
+		c.app.QueueUpdateDraw(func() {
+			c.refreshTopics()
+			// Select the topic
+			c.selectTopic(dmTopicName)
 		})
 	}()
 }
@@ -315,14 +463,7 @@ func (c *UIClient) showMainUI() {
 	c.refreshTopics()
 
 	c.currentTopic = ""
-	c.topicList.SetCurrentItem(-1)
-	c.topicList.SetHighlightFullLine(false)
 	c.app.SetFocus(c.topicList)
-
-	// No topic selected by default = no highlight
-	c.topicList.
-		SetSelectedTextColor(tcell.ColorWhite).
-		SetSelectedBackgroundColor(tcell.ColorDefault)
 }
 
 func (c *UIClient) showCreateTopicForm() {
@@ -367,6 +508,11 @@ func (c *UIClient) showJoinTopicList() {
 			list.SetBorder(true).SetTitle("Join Group")
 
 			for _, topic := range topics {
+				// Filter out DM topics from join list
+				if strings.HasPrefix(topic.Name, "_") {
+					continue
+				}
+
 				// Capture topic ID for closure
 				tID := topic.Id
 				tName := topic.Name
@@ -405,6 +551,52 @@ func (c *UIClient) joinTopic(topicID int64, topicName string) {
 	}
 }
 
+func (c *UIClient) leaveHighlightedTopic() {
+	highlights := c.topicList.GetHighlights()
+	for _, id := range highlights {
+		if strings.HasPrefix(id, "topic_") {
+			var tID int64
+			fmt.Sscanf(id, "topic_%d", &tID)
+			c.leaveTopicByID(tID)
+			return
+		}
+	}
+}
+
+func (c *UIClient) leaveTopicByID(topicID int64) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		err := c.LeaveTopic(ctx, topicID)
+		if err != nil {
+			c.showError(status.Convert(err).Message())
+			return
+		}
+
+		c.app.QueueUpdateDraw(func() {
+			// Check if we left the current topic
+			topic := c.getTopicByID(topicID)
+			if topic != nil && topic.Name == c.currentTopic {
+				if c.cancelSub != nil {
+					c.cancelSub()
+					c.cancelSub = nil
+				}
+				c.currentTopic = ""
+				c.messages = nil
+				c.messageLikes = make(map[int64]int)
+				c.messageLiked = make(map[int64]bool)
+				c.messageView.Clear()
+				c.messageView.SetTitle("Messages")
+				c.statusLine.SetText(fmt.Sprintf("Left topic: %s", topic.Name))
+			} else {
+				c.statusLine.SetText(fmt.Sprintf("Left topic %d", topicID))
+			}
+			c.refreshTopics()
+		})
+	}()
+}
+
 func (c *UIClient) refreshTopics() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -415,14 +607,115 @@ func (c *UIClient) refreshTopics() {
 		return
 	}
 
+	c.cachedTopics = topics
 	c.topicList.Clear()
+
+	// Clear highlights so tview state is reset
+	c.navigating = true
+	c.topicList.Highlight()
+	c.navigating = false
+
+	const lineWidth = 15
+	const icon = "x"
+
 	for _, topic := range topics {
-		c.topicList.AddItem(topic.Name, "", 0, nil)
+		name := topic.Name
+
+		// Handle DM display name
+		if strings.HasPrefix(name, "_") {
+			// Format: _user1_user2
+			parts := strings.Split(name, "_")
+			if len(parts) >= 3 {
+				// parts[0] is empty because string starts with _
+				// parts[1] is user1, parts[2] is user2
+				u1 := parts[1]
+				u2 := parts[2]
+				currentUser := c.Client.GetCurrentUserName()
+				if u1 == currentUser {
+					name = "_" + u2
+				} else {
+					name = "_" + u1
+				}
+			}
+		}
+
+		if len(name) > lineWidth {
+			name = name[:lineWidth]
+		}
+
+		// Format: ["topic_ID"] Name [""]   ["leave_ID"] 🗑 [""]
+		fmt.Fprintf(
+			c.topicList,
+			"[\"topic_%d\"]%-*s[\"\"][\"leave_%d\"] %s[\"\"]\n",
+			topic.Id,
+			lineWidth,
+			name,
+			topic.Id,
+			icon,
+		)
 	}
 
-	if c.currentTopic == "" {
-		c.topicList.SetCurrentItem(-1)
+	// Restore selection
+	if c.currentTopic != "" {
+		for _, t := range topics {
+			if t.Name == c.currentTopic {
+				c.navigating = true
+				c.topicList.Highlight(fmt.Sprintf("topic_%d", t.Id))
+				c.topicList.ScrollToHighlight()
+				c.navigating = false
+				break
+			}
+		}
 	}
+}
+
+func (c *UIClient) moveTopicSelection(delta int) {
+	if len(c.cachedTopics) == 0 {
+		return
+	}
+
+	// Find current index
+	currentIndex := -1
+	highlights := c.topicList.GetHighlights()
+	if len(highlights) > 0 {
+		for _, h := range highlights {
+			if strings.HasPrefix(h, "topic_") {
+				var tID int64
+				fmt.Sscanf(h, "topic_%d", &tID)
+				for i, t := range c.cachedTopics {
+					if t.Id == tID {
+						currentIndex = i
+						break
+					}
+				}
+				break
+			}
+		}
+	}
+
+	newIndex := currentIndex + delta
+	if newIndex < 0 {
+		newIndex = 0
+	}
+	if newIndex >= len(c.cachedTopics) {
+		newIndex = len(c.cachedTopics) - 1
+	}
+
+	if newIndex != currentIndex {
+		c.navigating = true
+		c.topicList.Highlight(fmt.Sprintf("topic_%d", c.cachedTopics[newIndex].Id))
+		c.topicList.ScrollToHighlight()
+		c.navigating = false
+	}
+}
+
+func (c *UIClient) getTopicByID(id int64) *pb.Topic {
+	for _, t := range c.cachedTopics {
+		if t.Id == id {
+			return t
+		}
+	}
+	return nil
 }
 
 func (c *UIClient) selectTopic(name string) {
@@ -432,9 +725,25 @@ func (c *UIClient) selectTopic(name string) {
 	}
 
 	c.currentTopic = name
+
+	displayName := name
+	if strings.HasPrefix(name, "_") {
+		parts := strings.Split(name, "_")
+		if len(parts) >= 3 {
+			u1 := parts[1]
+			u2 := parts[2]
+			currentUser := c.Client.GetCurrentUserName()
+			if u1 == currentUser {
+				displayName = "_" + u2
+			} else {
+				displayName = "_" + u1
+			}
+		}
+	}
+
 	c.messageView.Clear()
-	c.messageView.SetTitle(fmt.Sprintf("Messages: %s", name))
-	c.statusLine.SetText(fmt.Sprintf("Joined topic: %s", name))
+	c.messageView.SetTitle(fmt.Sprintf("Messages: %s", displayName))
+	c.statusLine.SetText(fmt.Sprintf("Joined topic: %s", displayName))
 	c.app.SetFocus(c.inputField)
 
 	// Reset message tracking for new topic
@@ -457,6 +766,27 @@ func (c *UIClient) postMessage(text string) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+
+		// If it's a DM, ensure the other user is in the topic
+		if strings.HasPrefix(c.currentTopic, "_") {
+			parts := strings.Split(c.currentTopic, "_")
+			if len(parts) >= 3 {
+				u1 := parts[1]
+				u2 := parts[2]
+				otherUserName := u1
+				if u1 == c.Client.GetCurrentUserName() {
+					otherUserName = u2
+				}
+
+				otherUser, err := c.Client.GetUserByName(ctx, otherUserName)
+				if err == nil {
+					topic, err := c.Client.GetTopicByName(ctx, c.currentTopic)
+					if err == nil {
+						_ = c.Client.JoinTopicForUser(ctx, topic.Id, otherUser.Id)
+					}
+				}
+			}
+		}
 
 		err := c.PostMessage(ctx, c.currentTopic, text)
 		if err != nil {
@@ -657,6 +987,15 @@ func (c *UIClient) subscribeInternal(ctx context.Context, topicNames []string, l
 		}
 
 		c.app.QueueUpdateDraw(func() {
+			// Check if we are still on the same topic
+			if c.currentTopic == "" {
+				return
+			}
+			// If message has topic name, verify it matches current topic
+			if event.Message != nil && event.Message.TopicName != "" && event.Message.TopicName != c.currentTopic {
+				return
+			}
+
 			if event.Op == pb.OpType_OP_POST {
 				if event.Message != nil && event.Message.Id > *lastMessageID {
 					*lastMessageID = event.Message.Id
