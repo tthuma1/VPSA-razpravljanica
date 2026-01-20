@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -795,6 +796,18 @@ func (n *Node) ReplicateWrite(_ context.Context, req *pb.ReplicationRequest) (*e
 		}
 	}
 
+	if n.testing && n.nodeID == "node3" {
+		if op.Operation != nil {
+			if postMsg, ok := op.Operation.(*pb.WriteOp_PostMessage); ok {
+				if postMsg.PostMessage.Text == "node3freeze" {
+					log.Printf("Node %s freezing on message 'node4freeze'", n.nodeID)
+					// Freeze indefinitely (or until killed)
+					select {}
+				}
+			}
+		}
+	}
+
 	event, err := n.applyWriteOp(op)
 	if err != nil {
 		return nil, err
@@ -822,10 +835,11 @@ func (n *Node) ReplicateWrite(_ context.Context, req *pb.ReplicationRequest) (*e
 func (n *Node) applyWriteOp(op *pb.WriteOp) (*pb.MessageEvent, error) {
 	// Log the operation first (idempotent)
 	if _, err := n.storage.LogOperation(op); err != nil {
+		if errors.Is(err, ErrDuplicateOperation) {
+			return nil, nil // Already applied
+		}
 		return nil, err
 	}
-
-	// TODO: if the operation is a duplicate, return nil, nil here
 
 	switch o := op.Operation.(type) {
 	case *pb.WriteOp_CreateUser:

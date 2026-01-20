@@ -19,6 +19,8 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+var ErrDuplicateOperation = errors.New("duplicate operation")
+
 type Storage struct {
 	db             *sql.DB
 	mu             sync.RWMutex
@@ -724,8 +726,7 @@ func (s *Storage) LogOperation(op *pb.WriteOp) (int64, error) {
 		var exists int
 		s.db.QueryRow("SELECT COUNT(*) FROM operation_log WHERE sequence_id = ?", op.Sequence).Scan(&exists)
 		if exists > 0 {
-			// TODO: return error and applyWriteOp do nothing if we get a duplicate
-			return op.Sequence, nil // Already logged
+			return op.Sequence, ErrDuplicateOperation // Already logged
 		}
 
 		// Check for gaps
