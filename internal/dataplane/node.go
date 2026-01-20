@@ -147,7 +147,7 @@ func (n *Node) SetRole(role NodeRole, nextNode, prevNode string) {
 				return
 			}
 			// Apply op
-			log.Printf("Applying %d, %s", op.Sequence, op.Operation)
+			log.Printf("Applying from SetRole to %s, seq=%d, %s", n.nodeID, op.Sequence, op.Operation)
 			_, err = n.applyWriteOp(op)
 			if err != nil {
 				//return fmt.Errorf("failed to apply op %d: %v", op.Sequence, err)
@@ -800,7 +800,7 @@ func (n *Node) ReplicateWrite(_ context.Context, req *pb.ReplicationRequest) (*e
 		if op.Operation != nil {
 			if postMsg, ok := op.Operation.(*pb.WriteOp_PostMessage); ok {
 				if postMsg.PostMessage.Text == "node3freeze" {
-					log.Printf("Node %s freezing on message 'node4freeze'", n.nodeID)
+					log.Printf("Node %s freezing on message 'node3freeze'", n.nodeID)
 					// Freeze indefinitely (or until killed)
 					select {}
 				}
@@ -898,6 +898,7 @@ func (n *Node) applyWriteOp(op *pb.WriteOp) (*pb.MessageEvent, error) {
 
 func (n *Node) AcknowledgeWrite(_ context.Context, req *pb.AcknowledgeRequest) (*emptypb.Empty, error) {
 	// Persist acknowledgement
+	log.Printf("Received ACK %d on %s", req.Sequence, n.nodeID)
 	if err := n.storage.UpdateLastAcked(req.Sequence); err != nil {
 		log.Printf("Failed to persist acknowledgement for seq %d: %v", req.Sequence, err)
 	}
