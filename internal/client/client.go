@@ -3,6 +3,8 @@ package client
 import (
 	"context"
 	"fmt"
+	"regexp"
+	"strings"
 	"time"
 
 	pb "messageboard/proto"
@@ -13,7 +15,7 @@ import (
 )
 
 type Client struct {
-	ControlAddr string
+	ControlAddrs []string
 
 	headConn   *grpc.ClientConn
 	headClient pb.MessageBoardClient
@@ -44,44 +46,35 @@ func (c *Client) Close() {
 }
 
 func (c *Client) Connect(controlAddr string) error {
-	c.ControlAddr = controlAddr
+	c.ControlAddrs = strings.Split(controlAddr, ",")
 	return c.RefreshTopology()
 }
 
 func (c *Client) RefreshTopology() error {
-	// If controlAddr is actually a node address (for testing), we might fail to get chain state if it's not a control plane.
-	// But in our architecture, clients talk to control plane to get topology.
-	// In the test, we passed "localhost:50061" (node1) to Connect.
-	// This is wrong if Connect expects Control Plane address.
-	// However, the test code I wrote passed node address.
-	// Let's check if we can make it robust.
-	// If we pass a node address, we can't get chain state from it (it doesn't implement ControlPlane service).
-	// So the test code was wrong to pass node address to Connect if Connect expects CP address.
-	// BUT, the prompt said "CLI client application that connects to the control plane to discover head and tail nodes".
-	// So Connect SHOULD take Control Plane address.
-	// In my test, I passed node address. I should fix the test.
-	// But wait, I am editing client.go now.
-	// I will keep it as is (expecting CP address).
+	var chainState *pb.ChainStateResponse
+	var err error
 
-	conn, err := grpc.NewClient(c.ControlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return fmt.Errorf("failed to connect to control plane: %w", err)
-	}
-	defer conn.Close() // Close CP connection after getting state
-
-	client := pb.NewControlPlaneClient(conn)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	state, err := client.GetChainState(ctx, &emptypb.Empty{})
-	if err != nil {
-		// Fallback for testing: if we can't get chain state, maybe we are connected directly to a node?
-		// This is useful for unit tests where we mock a single node.
-		// But for integration test with real nodes, we should use CP.
-		return fmt.Errorf("failed to get chain state: %w", err)
+	// Try to find the leader among the known control plane addresses
+	for _, addr := range c.ControlAddrs {
+		chainState, err = c.getChainStateFromNode(addr)
+		if err == nil {
+			break
+		}
+		// Check if error contains leader redirect
+		if leaderAddr := parseLeaderRedirect(err); leaderAddr != "" {
+			fmt.Printf("Redirecting to leader at %s\n", leaderAddr)
+			chainState, err = c.getChainStateFromNode(leaderAddr)
+			if err == nil {
+				break
+			}
+		}
 	}
 
-	if len(state.Chain) == 0 {
+	if chainState == nil {
+		return fmt.Errorf("failed to get chain state from any control plane node: %v", err)
+	}
+
+	if len(chainState.Chain) == 0 {
 		return fmt.Errorf("chain is empty")
 	}
 
@@ -89,17 +82,17 @@ func (c *Client) RefreshTopology() error {
 	c.Close()
 
 	// Connect to head
-	c.headConn, err = grpc.NewClient(state.Chain[0].Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	c.headConn, err = grpc.NewClient(chainState.Chain[0].Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return fmt.Errorf("failed to connect to head: %w", err)
 	}
 	c.headClient = pb.NewMessageBoardClient(c.headConn)
 
 	// Connect to all nodes for reading
-	c.readConns = make([]*grpc.ClientConn, 0, len(state.Chain))
-	c.readClients = make([]pb.MessageBoardClient, 0, len(state.Chain))
+	c.readConns = make([]*grpc.ClientConn, 0, len(chainState.Chain))
+	c.readClients = make([]pb.MessageBoardClient, 0, len(chainState.Chain))
 
-	for _, node := range state.Chain {
+	for _, node := range chainState.Chain {
 		conn, err := grpc.NewClient(node.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			fmt.Printf("Warning: failed to connect to node %s: %v\n", node.Address, err)
@@ -115,6 +108,30 @@ func (c *Client) RefreshTopology() error {
 
 	c.readIndex = 0
 	return nil
+}
+
+func (c *Client) getChainStateFromNode(addr string) (*pb.ChainStateResponse, error) {
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	client := pb.NewControlPlaneClient(conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	return client.GetChainState(ctx, &emptypb.Empty{})
+}
+
+func parseLeaderRedirect(err error) string {
+	// Error format: "rpc error: code = Unknown desc = not the leader, current leader is at <addr>"
+	re := regexp.MustCompile(`current leader is at ([\w.:]+)`)
+	matches := re.FindStringSubmatch(err.Error())
+	if len(matches) > 1 {
+		return matches[1]
+	}
+	return ""
 }
 
 func (c *Client) getReadClient() pb.MessageBoardClient {

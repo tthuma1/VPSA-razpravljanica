@@ -21,7 +21,7 @@ import (
 )
 
 var (
-	controlAddr = flag.String("control", "localhost:50050", "Control plane address")
+	controlAddr = flag.String("control", "localhost:50051,localhost:50052,localhost:50053", "Comma-separated list of Control plane addresses")
 )
 
 type UIClient struct {

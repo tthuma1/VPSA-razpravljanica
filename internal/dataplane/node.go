@@ -39,6 +39,8 @@ type Node struct {
 	prevNode    string // address of previous node in chain
 	topologyMu  sync.RWMutex
 	controlAddr string
+	cpClient    pb.ControlPlaneClient // Client for control plane communication
+	cpClientMu  sync.RWMutex
 
 	// Subscription management
 	subscriptions map[string]*Subscription
@@ -88,6 +90,12 @@ func NewNode(nodeID, address, dbPath, controlAddr string) (*Node, error) {
 	go node.runAckWorker()
 
 	return node, nil
+}
+
+func (n *Node) SetControlPlaneClient(client pb.ControlPlaneClient) {
+	n.cpClientMu.Lock()
+	defer n.cpClientMu.Unlock()
+	n.cpClient = client
 }
 
 func (n *Node) SetRole(role NodeRole, nextNode, prevNode string) {
@@ -997,13 +1005,13 @@ func (n *Node) SyncWithTail(ctx context.Context) error {
 		n.syncMu.Unlock()
 	}()
 
-	// Get tail node from control plane
-	cpConn, err := grpc.NewClient(n.controlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return fmt.Errorf("failed to connect to control plane: %v", err)
+	n.cpClientMu.RLock()
+	cpClient := n.cpClient
+	n.cpClientMu.RUnlock()
+
+	if cpClient == nil {
+		return fmt.Errorf("control plane client not set")
 	}
-	defer cpConn.Close()
-	cpClient := pb.NewControlPlaneClient(cpConn)
 
 	state, err := cpClient.GetClusterState(ctx, &emptypb.Empty{})
 	if err != nil {
@@ -1167,19 +1175,17 @@ func (n *Node) forwardGetUserByIDToTail(ctx context.Context, req *pb.GetUserById
 }
 
 func (n *Node) getTailClient() (pb.MessageBoardClient, *grpc.ClientConn, error) {
-	// We need to find the tail node. We can ask the control plane.
-	conn, err := grpc.NewClient(n.controlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to connect to control plane: %v", err)
+	n.cpClientMu.RLock()
+	cpClient := n.cpClient
+	n.cpClientMu.RUnlock()
+
+	if cpClient == nil {
+		return nil, nil, fmt.Errorf("control plane client not set")
 	}
-	// Don't close control plane conn here, we need it for the request
 
-	cpClient := pb.NewControlPlaneClient(conn)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	state, err := cpClient.GetClusterState(ctx, &emptypb.Empty{})
-	cancel()
-	conn.Close() // Close control plane connection
-
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to get cluster state: %v", err)
 	}
