@@ -264,7 +264,7 @@ func (c *UIClient) setupUI() {
 			c.showCreateTopicForm()
 		}), 3, 0, false).
 		AddItem(nil, 1, 0, false).
-		AddItem(tview.NewButton("Join Group").SetSelectedFunc(func() {
+		AddItem(tview.NewButton("Join Topic").SetSelectedFunc(func() {
 			c.showJoinTopicList()
 		}), 3, 0, false).
 		AddItem(nil, 1, 0, false).
@@ -505,7 +505,7 @@ func (c *UIClient) showJoinTopicList() {
 
 		c.app.QueueUpdateDraw(func() {
 			list := tview.NewList().ShowSecondaryText(false)
-			list.SetBorder(true).SetTitle("Join Group")
+			list.SetBorder(true).SetTitle("Join Topic")
 
 			for _, topic := range topics {
 				// Filter out DM topics from join list
@@ -860,9 +860,13 @@ func (c *UIClient) createTopic(name string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	err := c.CreateTopic(ctx, name)
-	if err != nil {
-		c.showError(status.Convert(err).Message())
+	if strings.HasPrefix(name, "_") {
+		c.showError("Topic name cannot start with _")
+	} else {
+		err := c.CreateTopic(ctx, name)
+		if err != nil {
+			c.showError(status.Convert(err).Message())
+		}
 	}
 }
 

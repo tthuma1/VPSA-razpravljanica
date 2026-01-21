@@ -566,7 +566,7 @@ func (s *Storage) GetMessagesByUser(topicID int64, userName string, limit int32,
 			SELECT m.id, m.topic_id, m.user_id, m.text, m.created_at, m.likes, t.name
 			FROM messages m
 			JOIN topics t ON m.topic_id = t.id
-			WHERE m.user_id = ?
+			WHERE m.user_id = ? AND t.name NOT LIKE '\_%' ESCAPE '\'
 			ORDER BY m.id DESC
 			LIMIT ?
 		`, user.Id, limit)
