@@ -1072,6 +1072,7 @@ const (
 	Replication_AcknowledgeWrite_FullMethodName = "/razpravljalnica.Replication/AcknowledgeWrite"
 	Replication_GetLastAcked_FullMethodName     = "/razpravljalnica.Replication/GetLastAcked"
 	Replication_GetLastSequence_FullMethodName  = "/razpravljalnica.Replication/GetLastSequence"
+	Replication_GetSnapshot_FullMethodName      = "/razpravljalnica.Replication/GetSnapshot"
 )
 
 // ReplicationClient is the client API for Replication service.
@@ -1084,6 +1085,7 @@ type ReplicationClient interface {
 	AcknowledgeWrite(ctx context.Context, in *AcknowledgeRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	GetLastAcked(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*GetLastAckedResponse, error)
 	GetLastSequence(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*GetLastSequenceResponse, error)
+	GetSnapshot(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (grpc.ServerStreamingClient[SnapshotChunk], error)
 }
 
 type replicationClient struct {
@@ -1163,6 +1165,25 @@ func (c *replicationClient) GetLastSequence(ctx context.Context, in *emptypb.Emp
 	return out, nil
 }
 
+func (c *replicationClient) GetSnapshot(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (grpc.ServerStreamingClient[SnapshotChunk], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Replication_ServiceDesc.Streams[1], Replication_GetSnapshot_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[emptypb.Empty, SnapshotChunk]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Replication_GetSnapshotClient = grpc.ServerStreamingClient[SnapshotChunk]
+
 // ReplicationServer is the server API for Replication service.
 // All implementations must embed UnimplementedReplicationServer
 // for forward compatibility.
@@ -1173,6 +1194,7 @@ type ReplicationServer interface {
 	AcknowledgeWrite(context.Context, *AcknowledgeRequest) (*emptypb.Empty, error)
 	GetLastAcked(context.Context, *emptypb.Empty) (*GetLastAckedResponse, error)
 	GetLastSequence(context.Context, *emptypb.Empty) (*GetLastSequenceResponse, error)
+	GetSnapshot(*emptypb.Empty, grpc.ServerStreamingServer[SnapshotChunk]) error
 	mustEmbedUnimplementedReplicationServer()
 }
 
@@ -1200,6 +1222,9 @@ func (UnimplementedReplicationServer) GetLastAcked(context.Context, *emptypb.Emp
 }
 func (UnimplementedReplicationServer) GetLastSequence(context.Context, *emptypb.Empty) (*GetLastSequenceResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetLastSequence not implemented")
+}
+func (UnimplementedReplicationServer) GetSnapshot(*emptypb.Empty, grpc.ServerStreamingServer[SnapshotChunk]) error {
+	return status.Error(codes.Unimplemented, "method GetSnapshot not implemented")
 }
 func (UnimplementedReplicationServer) mustEmbedUnimplementedReplicationServer() {}
 func (UnimplementedReplicationServer) testEmbeddedByValue()                     {}
@@ -1323,6 +1348,17 @@ func _Replication_GetLastSequence_Handler(srv interface{}, ctx context.Context, 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Replication_GetSnapshot_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(emptypb.Empty)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(ReplicationServer).GetSnapshot(m, &grpc.GenericServerStream[emptypb.Empty, SnapshotChunk]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Replication_GetSnapshotServer = grpc.ServerStreamingServer[SnapshotChunk]
+
 // Replication_ServiceDesc is the grpc.ServiceDesc for Replication service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1355,6 +1391,11 @@ var Replication_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "StreamLog",
 			Handler:       _Replication_StreamLog_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "GetSnapshot",
+			Handler:       _Replication_GetSnapshot_Handler,
 			ServerStreams: true,
 		},
 	},

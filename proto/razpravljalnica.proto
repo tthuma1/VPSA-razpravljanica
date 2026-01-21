@@ -242,6 +242,7 @@ service Replication {
   rpc AcknowledgeWrite(AcknowledgeRequest) returns (google.protobuf.Empty);
   rpc GetLastAcked(google.protobuf.Empty) returns (GetLastAckedResponse);
   rpc GetLastSequence(google.protobuf.Empty) returns (GetLastSequenceResponse);
+  rpc GetSnapshot(google.protobuf.Empty) returns (stream SnapshotChunk);
 }
 
 message StreamLogRequest {
@@ -274,4 +275,8 @@ message GetLastAckedResponse {
 
 message GetLastSequenceResponse {
   int64 sequence = 1;
+}
+
+message SnapshotChunk {
+  bytes content = 1;
 }
