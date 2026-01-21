@@ -21,27 +21,23 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-type NodeRole int
-
-const (
-	RoleHead NodeRole = iota
-	RoleTail
-	RoleMiddle
-)
-
 type Node struct {
 	pb.UnimplementedMessageBoardServer
 	pb.UnimplementedReplicationServer
 
-	nodeID      string
-	address     string
-	dbPath      string
-	testing     bool
-	storage     *Storage
-	role        NodeRole
-	nextNode    string // address of next node in chain
-	prevNode    string // address of previous node in chain
-	topologyMu  sync.RWMutex
+	nodeID  string
+	address string
+	dbPath  string
+	testing bool
+	storage *Storage
+
+	// Topology state
+	isHead     bool
+	isTail     bool
+	nextNode   string // address of next node in chain
+	prevNode   string // address of previous node in chain
+	topologyMu sync.RWMutex
+
 	controlAddr string
 	cpClient    pb.ControlPlaneClient // Client for control plane communication
 	cpClientMu  sync.RWMutex
@@ -107,68 +103,92 @@ func (n *Node) SetControlPlaneClient(client pb.ControlPlaneClient) {
 	n.cpClient = client
 }
 
-func (n *Node) SetRole(role NodeRole, nextNode, prevNode string) {
+func (n *Node) SetTopology(isHead, isTail bool, nextNode, prevNode string) {
 	n.topologyMu.Lock()
-	defer n.topologyMu.Unlock()
 
-	//changedNextNode := n.nextNode != nextNode
 	changedPrevNode := n.prevNode != prevNode
-	if n.role == role && n.nextNode == nextNode && n.prevNode == prevNode {
+	if n.isHead == isHead && n.isTail == isTail && n.nextNode == nextNode && n.prevNode == prevNode {
+		n.topologyMu.Unlock()
 		return
 	}
 
-	n.role = role
+	n.isHead = isHead
+	n.isTail = isTail
 	n.nextNode = nextNode
 	n.prevNode = prevNode
-	log.Printf("Node %s role set to %v, next node: %s, prev node: %s", n.nodeID, n.role, n.nextNode, n.prevNode)
+	log.Printf("Node %s topology updated: isHead=%v, isTail=%v, next=%s, prev=%s", n.nodeID, n.isHead, n.isTail, n.nextNode, n.prevNode)
+
+	// Capture state for async work
+	amITail := n.isTail
+	targetPrevNode := n.prevNode
+
+	n.topologyMu.Unlock() // Release lock immediately to avoid blocking Control Plane
 
 	lastSeq := n.storage.GetLastSequence()
 	lastAck, _ := n.storage.GetLastAcked()
-	if n.role == RoleTail {
+
+	if amITail {
 		// The old tail may have not sent us all ACKs yet, so generate the latest ACK here.
-		log.Printf("Role changed to tail, sending %d as last ACK", lastSeq)
+		// In a single node scenario, this is also crucial to mark everything as acked.
+		log.Printf("Role includes TAIL, ensuring last ACK is up to date (seq %d)", lastSeq)
 		if err := n.storage.UpdateLastAcked(lastSeq); err != nil {
 			log.Printf("Failed to update last acked: %v", err)
 		}
-		n.ackQueue <- lastSeq
+
+		// Only send to ackQueue if we have a previous node to send to
+		if targetPrevNode != "" {
+			select {
+			case n.ackQueue <- lastSeq:
+			default:
+				log.Printf("Ack queue full, dropping ack %d", lastSeq)
+			}
+		}
 	}
 
-	if changedPrevNode && n.prevNode != "" {
-		n.ackQueue <- lastAck
+	if changedPrevNode && targetPrevNode != "" {
+		// Send lastAck to the new previous node so it knows where we are
+		select {
+		case n.ackQueue <- lastAck:
+		default:
+		}
 
 		// Stream operation from lastSeq+1
-		conn, err := grpc.NewClient(n.prevNode, grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			// TODO: handle error
-			return
-		}
-		defer conn.Close()
-		prevNodeClient := pb.NewReplicationClient(conn)
-		stream, err := prevNodeClient.StreamLog(context.Background(), &pb.StreamLogRequest{FromSequence: lastSeq + 1})
-		if err != nil {
-			// TODO: handle error
-			return
-		}
-
-		for {
-			op, err := stream.Recv()
-			if err == io.EOF {
-				break
-			}
+		go func(addr string, startSeq int64) {
+			log.Printf("Starting sync from new prev node %s at seq %d", addr, startSeq)
+			conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 			if err != nil {
-				// TODO: handle error
-				// stream error
+				log.Printf("Failed to connect to prev node %s: %v", addr, err)
 				return
 			}
-			// Apply op
-			log.Printf("Applying %d, %s", op.Sequence, op.Operation)
-			_, err = n.applyWriteOp(op)
+			defer conn.Close()
+
+			prevNodeClient := pb.NewReplicationClient(conn)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			stream, err := prevNodeClient.StreamLog(ctx, &pb.StreamLogRequest{FromSequence: startSeq})
 			if err != nil {
-				//return fmt.Errorf("failed to apply op %d: %v", op.Sequence, err)
-				// TODO: handle error
-				// No return here, because this might happen if we applied a duplicate
+				log.Printf("Failed to stream log from %s: %v", addr, err)
+				return
 			}
-		}
+
+			for {
+				op, err := stream.Recv()
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					log.Printf("Stream error from %s: %v", addr, err)
+					return
+				}
+				// Apply op
+				log.Printf("Applying synced op %d, %s", op.Sequence, op.Operation)
+				_, err = n.applyWriteOp(op)
+				if err != nil {
+					log.Printf("Failed to apply synced op %d: %v", op.Sequence, err)
+				}
+			}
+		}(targetPrevNode, lastSeq+1)
 	}
 }
 
@@ -183,21 +203,7 @@ func (n *Node) checkSyncing() error {
 
 func (n *Node) NotifyStateChange(_ context.Context, req *pb.StateChangeNotification) (*emptypb.Empty, error) {
 	log.Printf("Node %s received state change: prevNode=%s, nextNode=%s, isHead=%v, isTail=%v", n.nodeID, req.PrevNode, req.NextNode, req.IsHead, req.IsTail)
-
-	prevNode := req.PrevNode
-	nextNode := req.NextNode
-	var role NodeRole
-
-	if req.IsHead {
-		role = RoleHead
-	} else if req.IsTail {
-		role = RoleTail
-	} else {
-		role = RoleMiddle
-	}
-
-	n.SetRole(role, nextNode, prevNode)
-
+	n.SetTopology(req.IsHead, req.IsTail, req.NextNode, req.PrevNode)
 	return &emptypb.Empty{}, nil
 }
 
@@ -206,7 +212,7 @@ func (n *Node) CreateUser(ctx context.Context, req *pb.CreateUserRequest) (*pb.U
 	if err := n.checkSyncing(); err != nil {
 		return nil, err
 	}
-	if n.role != RoleHead {
+	if !n.isHead {
 		return nil, fmt.Errorf("not the head node")
 	}
 
@@ -255,6 +261,17 @@ func (n *Node) CreateUser(ctx context.Context, req *pb.CreateUserRequest) (*pb.U
 			n.pendingMu.Unlock()
 			return nil, ctx.Err()
 		}
+	} else {
+		// Single node case: Log operation and update ack immediately
+		seq, err := n.storage.LogOperation(&pb.WriteOp{
+			Operation: &pb.WriteOp_CreateUser{CreateUser: req},
+		})
+		if err != nil {
+			return nil, err
+		}
+		if err := n.storage.UpdateLastAcked(seq); err != nil {
+			log.Printf("Failed to auto-ack on single node: %v", err)
+		}
 	}
 
 	return user, nil
@@ -266,7 +283,7 @@ func (n *Node) Login(ctx context.Context, req *pb.LoginRequest) (*pb.User, error
 	}
 	// Login is a read operation but involves password verification.
 	// Check if we have unacknowledged writes. If so, forward to tail.
-	if n.role != RoleTail && n.hasPendingWrites() {
+	if !n.isTail && n.hasPendingWrites() {
 		return n.forwardLoginToTail(ctx, req)
 	}
 
@@ -283,7 +300,7 @@ func (n *Node) GetUser(ctx context.Context, req *pb.GetUserRequest) (*pb.User, e
 		return nil, err
 	}
 	// Check if we have unacknowledged writes. If so, forward to tail.
-	if n.role != RoleTail && n.hasPendingWrites() {
+	if !n.isTail && n.hasPendingWrites() {
 		return n.forwardGetUserToTail(ctx, req)
 	}
 
@@ -299,7 +316,7 @@ func (n *Node) GetUser(ctx context.Context, req *pb.GetUserRequest) (*pb.User, e
 }
 
 func (n *Node) GetUserById(ctx context.Context, req *pb.GetUserByIdRequest) (*pb.User, error) {
-	if n.role != RoleTail && n.hasPendingWrites() {
+	if !n.isTail && n.hasPendingWrites() {
 		return n.forwardGetUserByIDToTail(ctx, req)
 	}
 
@@ -318,7 +335,7 @@ func (n *Node) CreateTopic(ctx context.Context, req *pb.CreateTopicRequest) (*pb
 	if err := n.checkSyncing(); err != nil {
 		return nil, err
 	}
-	if n.role != RoleHead {
+	if !n.isHead {
 		return nil, fmt.Errorf("not the head node")
 	}
 
@@ -363,6 +380,17 @@ func (n *Node) CreateTopic(ctx context.Context, req *pb.CreateTopicRequest) (*pb
 			n.pendingMu.Unlock()
 			return nil, ctx.Err()
 		}
+	} else {
+		// Single node case
+		seq, err := n.storage.LogOperation(&pb.WriteOp{
+			Operation: &pb.WriteOp_CreateTopic{CreateTopic: req},
+		})
+		if err != nil {
+			return nil, err
+		}
+		if err := n.storage.UpdateLastAcked(seq); err != nil {
+			log.Printf("Failed to auto-ack on single node: %v", err)
+		}
 	}
 
 	return topic, nil
@@ -373,7 +401,7 @@ func (n *Node) GetTopic(ctx context.Context, req *pb.GetTopicRequest) (*pb.Topic
 		return nil, err
 	}
 	// Check if we have unacknowledged writes. If so, forward to tail.
-	if n.role != RoleTail && n.hasPendingWrites() {
+	if !n.isTail && n.hasPendingWrites() {
 		return n.forwardGetTopicToTail(ctx, req)
 	}
 
@@ -392,7 +420,7 @@ func (n *Node) PostMessage(ctx context.Context, req *pb.PostMessageRequest) (*pb
 	if err := n.checkSyncing(); err != nil {
 		return nil, err
 	}
-	if n.role != RoleHead {
+	if !n.isHead {
 		return nil, fmt.Errorf("not the head node")
 	}
 
@@ -447,6 +475,11 @@ func (n *Node) PostMessage(ctx context.Context, req *pb.PostMessageRequest) (*pb
 			n.pendingMu.Unlock()
 			return nil, ctx.Err()
 		}
+	} else {
+		// Single node case
+		if err := n.storage.UpdateLastAcked(seq); err != nil {
+			log.Printf("Failed to auto-ack on single node: %v", err)
+		}
 	}
 
 	return msg, nil
@@ -456,7 +489,7 @@ func (n *Node) LikeMessage(ctx context.Context, req *pb.LikeMessageRequest) (*pb
 	if err := n.checkSyncing(); err != nil {
 		return nil, err
 	}
-	if n.role != RoleHead {
+	if !n.isHead {
 		return nil, fmt.Errorf("not the head node")
 	}
 
@@ -511,6 +544,11 @@ func (n *Node) LikeMessage(ctx context.Context, req *pb.LikeMessageRequest) (*pb
 			n.pendingMu.Unlock()
 			return nil, ctx.Err()
 		}
+	} else {
+		// Single node case
+		if err := n.storage.UpdateLastAcked(seq); err != nil {
+			log.Printf("Failed to auto-ack on single node: %v", err)
+		}
 	}
 
 	return msg, nil
@@ -520,7 +558,7 @@ func (n *Node) JoinTopic(ctx context.Context, req *pb.JoinTopicRequest) (*emptyp
 	if err := n.checkSyncing(); err != nil {
 		return nil, err
 	}
-	if n.role != RoleHead {
+	if !n.isHead {
 		return nil, fmt.Errorf("not the head node")
 	}
 
@@ -565,6 +603,17 @@ func (n *Node) JoinTopic(ctx context.Context, req *pb.JoinTopicRequest) (*emptyp
 			n.pendingMu.Unlock()
 			return nil, ctx.Err()
 		}
+	} else {
+		// Single node case
+		seq, err := n.storage.LogOperation(&pb.WriteOp{
+			Operation: &pb.WriteOp_JoinTopic{JoinTopic: req},
+		})
+		if err != nil {
+			return nil, err
+		}
+		if err := n.storage.UpdateLastAcked(seq); err != nil {
+			log.Printf("Failed to auto-ack on single node: %v", err)
+		}
 	}
 
 	return &emptypb.Empty{}, nil
@@ -574,7 +623,7 @@ func (n *Node) LeaveTopic(ctx context.Context, req *pb.LeaveTopicRequest) (*empt
 	if err := n.checkSyncing(); err != nil {
 		return nil, err
 	}
-	if n.role != RoleHead {
+	if !n.isHead {
 		return nil, fmt.Errorf("not the head node")
 	}
 
@@ -619,6 +668,17 @@ func (n *Node) LeaveTopic(ctx context.Context, req *pb.LeaveTopicRequest) (*empt
 			n.pendingMu.Unlock()
 			return nil, ctx.Err()
 		}
+	} else {
+		// Single node case
+		seq, err := n.storage.LogOperation(&pb.WriteOp{
+			Operation: &pb.WriteOp_LeaveTopic{LeaveTopic: req},
+		})
+		if err != nil {
+			return nil, err
+		}
+		if err := n.storage.UpdateLastAcked(seq); err != nil {
+			log.Printf("Failed to auto-ack on single node: %v", err)
+		}
 	}
 
 	return &emptypb.Empty{}, nil
@@ -630,7 +690,7 @@ func (n *Node) ListTopics(ctx context.Context, req *pb.ListTopicsRequest) (*pb.L
 		return nil, err
 	}
 	// Check if we have unacknowledged writes. If so, forward to tail.
-	if n.role != RoleTail && n.hasPendingWrites() {
+	if !n.isTail && n.hasPendingWrites() {
 		return n.forwardListTopicsToTail(ctx, req)
 	}
 
@@ -647,7 +707,7 @@ func (n *Node) ListAllTopics(ctx context.Context, _ *emptypb.Empty) (*pb.ListTop
 		return nil, err
 	}
 	// Check if we have unacknowledged writes. If so, forward to tail.
-	if n.role != RoleTail && n.hasPendingWrites() {
+	if !n.isTail && n.hasPendingWrites() {
 		return n.forwardListAllTopicsToTail(ctx)
 	}
 
@@ -664,7 +724,7 @@ func (n *Node) ListJoinableTopics(ctx context.Context, req *pb.ListJoinableTopic
 		return nil, err
 	}
 	// Check if we have unacknowledged writes. If so, forward to tail.
-	if n.role != RoleTail && n.hasPendingWrites() {
+	if !n.isTail && n.hasPendingWrites() {
 		return n.forwardListJoinableTopicsToTail(ctx, req)
 	}
 
@@ -689,7 +749,7 @@ func (n *Node) GetMessages(ctx context.Context, req *pb.GetMessagesRequest) (*pb
 		return nil, err
 	}
 	// Check if we have unacknowledged writes. If so, forward to tail.
-	if n.role != RoleTail && n.hasPendingWrites() {
+	if !n.isTail && n.hasPendingWrites() {
 		return n.forwardGetMessagesToTail(ctx, req)
 	}
 
@@ -706,7 +766,7 @@ func (n *Node) GetMessagesByUser(ctx context.Context, req *pb.GetMessagesByUserR
 		return nil, err
 	}
 	// Check if we have unacknowledged writes. If so, forward to tail.
-	if n.role != RoleTail && n.hasPendingWrites() {
+	if !n.isTail && n.hasPendingWrites() {
 		return n.forwardGetMessagesByUserToTail(ctx, req)
 	}
 
@@ -724,7 +784,7 @@ func (n *Node) GetSubscriptionNode(ctx context.Context, _ *pb.SubscriptionNodeRe
 	if err := n.checkSyncing(); err != nil {
 		return nil, err
 	}
-	if n.role != RoleHead {
+	if !n.isHead {
 		return nil, fmt.Errorf("not the head node")
 	}
 
@@ -839,11 +899,14 @@ func (n *Node) ReplicateWrite(_ context.Context, req *pb.ReplicationRequest) (*e
 	}
 
 	// Forward to next node
-	if n.nextNode != "" && n.role != RoleTail {
+	if n.nextNode != "" && !n.isTail {
 		n.replQueue <- op
-	} else if n.role == RoleTail {
+	} else if n.isTail {
 		// If we are the tail, we acknowledge the write to the previous node
-		n.ackQueue <- op.Sequence
+		// Only send to ackQueue if we have a previous node (not single node case)
+		if n.prevNode != "" {
+			n.ackQueue <- op.Sequence
+		}
 		// Also update our own last acked sequence
 		if err := n.storage.UpdateLastAcked(op.Sequence); err != nil {
 			log.Printf("Failed to update last acked: %v", err)
@@ -927,7 +990,7 @@ func (n *Node) AcknowledgeWrite(_ context.Context, req *pb.AcknowledgeRequest) (
 	delete(n.pendingWrites, req.Sequence)
 	n.pendingMu.Unlock()
 
-	if n.role == RoleHead {
+	if n.isHead {
 		if exists && ch != nil {
 			// Make this node send a successful response to the client
 			ch <- nil
