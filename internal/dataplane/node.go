@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -34,6 +35,7 @@ type Node struct {
 
 	nodeID      string
 	address     string
+	dbPath      string
 	testing     bool
 	storage     *Storage
 	role        NodeRole
@@ -82,6 +84,7 @@ func NewNode(nodeID, address, dbPath, controlAddr string, testing bool) (*Node, 
 	node := &Node{
 		nodeID:        nodeID,
 		address:       address,
+		dbPath:        dbPath,
 		storage:       storage,
 		testing:       testing,
 		subscriptions: make(map[string]*Subscription),
@@ -1097,6 +1100,40 @@ func (n *Node) StreamLog(req *pb.StreamLogRequest, stream pb.Replication_StreamL
 	return nil
 }
 
+func (n *Node) GetSnapshot(_ *emptypb.Empty, stream pb.Replication_GetSnapshotServer) error {
+	tempSnapshot := fmt.Sprintf("%s.snap.%d", n.dbPath, time.Now().UnixNano())
+	defer os.Remove(tempSnapshot)
+
+	// Create a consistent snapshot using VACUUM INTO
+	_, err := n.storage.db.Exec("VACUUM INTO ?", tempSnapshot)
+	if err != nil {
+		return fmt.Errorf("failed to create snapshot: %v", err)
+	}
+
+	file, err := os.Open(tempSnapshot)
+	if err != nil {
+		return fmt.Errorf("failed to open snapshot file: %v", err)
+	}
+	defer file.Close()
+
+	buffer := make([]byte, 64*1024) // 64KB chunks
+	for {
+		n, err := file.Read(buffer)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("failed to read snapshot file: %v", err)
+		}
+
+		if err := stream.Send(&pb.SnapshotChunk{Content: buffer[:n]}); err != nil {
+			return fmt.Errorf("failed to send snapshot chunk: %v", err)
+		}
+	}
+
+	return nil
+}
+
 func (n *Node) SyncWithTail(ctx context.Context) error {
 	n.syncMu.Lock()
 	n.syncing = true
@@ -1136,6 +1173,55 @@ func (n *Node) SyncWithTail(ctx context.Context) error {
 	}
 	defer conn.Close()
 	client := pb.NewReplicationClient(conn)
+
+	lastSeq := n.storage.GetLastSequence()
+	lastAcked, _ := n.storage.GetLastAcked()
+	if lastSeq != lastAcked {
+		log.Printf("Unacked writes detected (lastSeq: %d, lastAcked: %d). Requesting full snapshot from tail.", lastSeq, lastAcked)
+
+		stream, err := client.GetSnapshot(ctx, &emptypb.Empty{})
+		if err != nil {
+			return fmt.Errorf("failed to start snapshot stream: %v", err)
+		}
+
+		tempDB := n.dbPath + ".sync.tmp"
+		// Ensure temp file doesn't exist
+		os.Remove(tempDB)
+
+		f, err := os.Create(tempDB)
+		if err != nil {
+			return fmt.Errorf("failed to create temp db file: %v", err)
+		}
+
+		for {
+			chunk, err := stream.Recv()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				f.Close()
+				os.Remove(tempDB)
+				return fmt.Errorf("snapshot stream error: %v", err)
+			}
+			if _, err := f.Write(chunk.Content); err != nil {
+				f.Close()
+				os.Remove(tempDB)
+				return fmt.Errorf("failed to write to temp db file: %v", err)
+			}
+		}
+		f.Close()
+
+		n.storage.Close()
+		if err := os.Rename(tempDB, n.dbPath); err != nil {
+			return fmt.Errorf("failed to replace db file: %v", err)
+		}
+
+		newStorage, err := NewStorage(n.dbPath)
+		if err != nil {
+			return fmt.Errorf("failed to create new storage: %v", err)
+		}
+		n.storage = newStorage
+	}
 
 	// Retry only happens when there is a sequence number mismatch. Other failures fail immediately.
 	const maxRetries = 5
